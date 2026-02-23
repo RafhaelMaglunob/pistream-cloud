@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: pistream-cloud
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn relay_server:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PUSH_SECRET
+        value: changeme123
+    plan: free

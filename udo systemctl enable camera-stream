@@ -1,0 +1,7 @@
+● camera-stream.service - Camera Stream and Discovery Service
+     Loaded: loaded (]8;;file://admin/etc/systemd/system/camera-stream.service\/etc/systemd/system/camera-stream.service]8;;\; [0;1;38:5:185mdisabled[0m; preset: [0;1;32menabled[0m)
+     Active: activating (auto-restart) (Result: exit-code) since Tue 2026-02-17 23:48:18 PST; 3s ago
+ Invocation: 29c97a16bd4d41409743b5f07b2cd74e
+    Process: 58754 ExecStart=/home/raspberrypi/start-all-services.sh [0;1;31m(code=exited, status=203/EXEC)[0m
+   Main PID: 58754 (code=exited, status=203/EXEC)
+        CPU: 7ms
