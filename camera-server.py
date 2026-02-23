@@ -365,13 +365,6 @@ def overlay_worker():
         with overlay_lock:
             latest_overlay_frame = rendered
 
-        # Queue frame for cloud — non-blocking, drops if cloud is slow
-        if CLOUD_ENABLED:
-            try:
-                frame_queue.put_nowait(rendered)
-            except queue.Full:
-                pass  # cloud is slow, drop frame — local stream unaffected
-
 def ml_worker():
     last_processed = None
     while True:
@@ -388,8 +381,8 @@ def ml_worker():
 # ------------------------ CLOUD SENDER (single thread, never blocks local) --
 def cloud_sender():
     """
-    Single thread handles ALL cloud pushes via queues.
-    If Render is slow/down, this thread waits — local stream is NEVER affected.
+    Completely separate thread — reads directly from latest_overlay_frame.
+    NEVER touches the local stream pipeline. If Render is slow, only this thread waits.
     """
     if not CLOUD_ENABLED:
         return
@@ -401,81 +394,69 @@ def cloud_sender():
     last_status_push = 0
     last_gps_push    = 0
     last_ml_push     = 0
+    last_sent_frame  = None
 
     print(f"[CLOUD] Sender started → {CLOUD_URL}")
 
     while True:
         now = time.time()
 
-        # ── Push frame at max 2fps ──────────────────────────────
-        if now - last_frame_push >= 0.5:
-            frame = None
-            # Drain queue, keep only latest
-            while not frame_queue.empty():
-                try:
-                    frame = frame_queue.get_nowait()
-                except queue.Empty:
-                    break
-            if frame:
+        # ── Push frame at max 1fps (free tier friendly) ─────────
+        if now - last_frame_push >= 1.0:
+            with overlay_lock:
+                frame = latest_overlay_frame
+            if frame is None:
+                with frame_lock:
+                    frame = latest_frame
+            if frame is not None and frame is not last_sent_frame:
                 try:
                     r = session.post(f"{CLOUD_URL}/push/frame",
                                      data=frame,
                                      headers={"Content-Type": "image/jpeg"},
-                                     timeout=5)
+                                     timeout=8)
                     if r.status_code == 401:
                         print("[CLOUD] ❌ Wrong PUSH_SECRET!")
                     elif r.status_code == 200:
+                        last_sent_frame = frame
                         last_frame_push = now
                 except Exception as e:
-                    print(f"[CLOUD] Frame push failed: {e}")
+                    print(f"[CLOUD] Frame: {e}")
 
-        # ── Push ML results every 1s ────────────────────────────
-        if now - last_ml_push >= 1.0:
-            ml = None
-            while not ml_queue.empty():
-                try:
-                    ml = ml_queue.get_nowait()
-                except queue.Empty:
-                    break
-            if ml is not None:
-                try:
-                    session.post(f"{CLOUD_URL}/push/ml",
-                                 json=ml,
-                                 timeout=5)
-                    last_ml_push = now
-                except Exception as e:
-                    print(f"[CLOUD] ML push failed: {e}")
+        # ── Push ML every 2s ────────────────────────────────────
+        if now - last_ml_push >= 2.0:
+            with ml_lock:
+                ml = ml_results.copy()
+            try:
+                session.post(f"{CLOUD_URL}/push/ml",
+                             json=ml, timeout=5)
+                last_ml_push = now
+            except Exception:
+                pass
 
-        # ── Push status every 5s ────────────────────────────────
-        if now - last_status_push >= 5.0:
+        # ── Push status every 10s ───────────────────────────────
+        if now - last_status_push >= 10.0:
             with camera_status_lock:
                 status = camera_status
             try:
                 session.post(f"{CLOUD_URL}/push/status",
-                             json={"status": status},
-                             timeout=5)
+                             json={"status": status}, timeout=5)
                 last_status_push = now
             except Exception:
                 pass
 
-        # ── Push GPS every 5s ───────────────────────────────────
-        if now - last_gps_push >= 5.0:
-            gps = None
-            while not gps_queue.empty():
-                try:
-                    gps = gps_queue.get_nowait()
-                except queue.Empty:
-                    break
-            if gps:
+        # ── Push GPS every 10s ──────────────────────────────────
+        if now - last_gps_push >= 10.0:
+            with gps_state_lock:
+                gps = gps_state.copy()
+            if gps['lat'] and gps['lon']:
                 try:
                     session.post(f"{CLOUD_URL}/push/gps",
-                                 json=gps,
-                                 timeout=5)
+                                 json=gps, timeout=5)
                     last_gps_push = now
                 except Exception:
                     pass
 
-        time.sleep(0.1)
+        time.sleep(0.5)  # cloud sender loops every 0.5s max
 
 # ------------------------ GPS WORKER ------------------------
 def gps_worker():
