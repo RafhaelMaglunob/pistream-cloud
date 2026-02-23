@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from flask import Flask, Response, request, jsonify, render_template_string
-import threading, time, socket, io, subprocess
+import threading, time, socket, io, subprocess, queue
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import colorsys
@@ -12,21 +12,18 @@ app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # ------------------------ CLOUD CONFIG ------------------------
-CLOUD_URL     = "https://pistream-cloud.onrender.com"  # ← your Render URL
-PUSH_SECRET   = "Rafhael@1"                            # ← must match Render env var
+CLOUD_URL     = "https://pistream-cloud.onrender.com"
+PUSH_SECRET   = "Rafhael@1"
 CLOUD_ENABLED = True
 
 PUSH_HEADERS_FRAME = {"X-Secret": PUSH_SECRET, "Content-Type": "image/jpeg"}
 PUSH_HEADERS_JSON  = {"X-Secret": PUSH_SECRET, "Content-Type": "application/json"}
 
 # ------------------------ GPS CONFIG --------------------------
-# Option A: No GPS hardware → set your fixed location here
 STATIC_LAT = None   # e.g. 14.5995
 STATIC_LON = None   # e.g. 120.9842
-
-# Option B: Hardware GPS (NEO-6M etc.) → install: pip install pyserial pynmea2
-GPS_PORT = "/dev/ttyAMA0"
-GPS_BAUD = 9600
+GPS_PORT   = "/dev/ttyAMA0"
+GPS_BAUD   = 9600
 
 # ------------------------ GLOBALS ------------------------
 latest_frame = None
@@ -50,9 +47,14 @@ model      = None
 camera_status      = "Starting..."
 camera_status_lock = threading.Lock()
 
-# Shared GPS state (updated by GPS worker, read by local Flask UI)
 gps_state      = {"lat": None, "lon": None, "speed": None}
 gps_state_lock = threading.Lock()
+
+# Non-blocking queue for cloud pushes — never blocks local stream
+frame_queue  = queue.Queue(maxsize=2)   # only keep latest 2 frames
+ml_queue     = queue.Queue(maxsize=5)
+status_queue = queue.Queue(maxsize=5)
+gps_queue    = queue.Queue(maxsize=5)
 
 # ------------------------ UTILS ------------------------
 def get_local_ip():
@@ -76,6 +78,10 @@ def set_camera_status(msg):
     with camera_status_lock:
         camera_status = msg
     print(f"[CAMERA] {msg}")
+    try:
+        status_queue.put_nowait(msg)
+    except queue.Full:
+        pass
 
 def rgb_to_color_name(r, g, b):
     h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
@@ -169,6 +175,10 @@ def detect_accidents_in_frame(frame_bytes):
                 })
         with ml_lock:
             ml_results = boxes
+        try:
+            ml_queue.put_nowait(boxes)
+        except queue.Full:
+            pass
     except Exception as e:
         print(f"ML detection error: {e}")
 
@@ -293,7 +303,6 @@ def camera_thread():
                     buffer = buffer[eoi + 2:]
 
                     if len(frame) < 1024:
-                        print(f"[CAMERA] Skipping tiny frame ({len(frame)} bytes)")
                         continue
 
                     last_frame_time  = time.time()
@@ -331,7 +340,7 @@ def camera_thread():
             restart_delay = 2
 
         restart_delay = min(max_delay, 2 * (consecutive_failures + 1))
-        set_camera_status(f"Restarting in {restart_delay}s (failures: {consecutive_failures})...")
+        set_camera_status(f"Restarting in {restart_delay}s...")
         time.sleep(restart_delay)
 
 # ------------------------ DETECTION WORKERS ------------------------
@@ -341,7 +350,7 @@ def overlay_worker():
     color_skip     = 0
 
     while True:
-        time.sleep(0.066)
+        time.sleep(0.066)  # 15fps local stream — unaffected by cloud
         with frame_lock:
             frame = latest_frame
         if frame is None or frame is last_processed:
@@ -356,6 +365,13 @@ def overlay_worker():
         with overlay_lock:
             latest_overlay_frame = rendered
 
+        # Queue frame for cloud — non-blocking, drops if cloud is slow
+        if CLOUD_ENABLED:
+            try:
+                frame_queue.put_nowait(rendered)
+            except queue.Full:
+                pass  # cloud is slow, drop frame — local stream unaffected
+
 def ml_worker():
     last_processed = None
     while True:
@@ -369,102 +385,111 @@ def ml_worker():
         last_processed = frame
         detect_accidents_in_frame(frame)
 
-# ------------------------ CLOUD PUSH WORKERS ------------------------
-def cloud_frame_worker():
-    if not CLOUD_ENABLED:
-        return
-    last_pushed = None
-    print(f"[CLOUD] Frame pusher started → {CLOUD_URL}")
-
-    while True:
-        time.sleep(0.5)  # 2fps
-        with overlay_lock:
-            frame = latest_overlay_frame
-        if frame is None:
-            with frame_lock:
-                frame = latest_frame
-        if frame is None or frame is last_pushed:
-            continue
-        last_pushed = frame
-
-        try:
-            r = req_lib.post(f"{CLOUD_URL}/push/frame",
-                             data=frame,
-                             headers=PUSH_HEADERS_FRAME,
-                             timeout=3)
-            if r.status_code == 401:
-                print("[CLOUD] ❌ Wrong PUSH_SECRET!")
-        except req_lib.exceptions.ConnectionError:
-            print("[CLOUD] ⚠️  Render unreachable, retrying...")
-        except req_lib.exceptions.Timeout:
-            print("[CLOUD] ⚠️  Frame push timed out")
-        except Exception as e:
-            print(f"[CLOUD] Frame error: {e}")
-
-def cloud_ml_worker():
-    if not CLOUD_ENABLED:
-        return
-    last_pushed = None
-    while True:
-        time.sleep(1)
-        with ml_lock:
-            results = ml_results.copy()
-        if results == last_pushed:
-            continue
-        last_pushed = results
-        try:
-            req_lib.post(f"{CLOUD_URL}/push/ml",
-                         json=results,
-                         headers=PUSH_HEADERS_JSON,
-                         timeout=3)
-        except Exception as e:
-            print(f"[CLOUD] ML push error: {e}")
-
-def cloud_status_worker():
-    if not CLOUD_ENABLED:
-        return
-    while True:
-        time.sleep(3)
-        with camera_status_lock:
-            status = camera_status
-        try:
-            req_lib.post(f"{CLOUD_URL}/push/status",
-                         json={"status": status},
-                         headers=PUSH_HEADERS_JSON,
-                         timeout=3)
-        except Exception as e:
-            print(f"[CLOUD] Status push error: {e}")
-
-def cloud_gps_worker():
+# ------------------------ CLOUD SENDER (single thread, never blocks local) --
+def cloud_sender():
     """
-    Pushes GPS to Render. Supports:
-      - Hardware GPS module (NEO-6M via serial): pip install pyserial pynmea2
-      - Static coordinates: set STATIC_LAT / STATIC_LON at top of file
+    Single thread handles ALL cloud pushes via queues.
+    If Render is slow/down, this thread waits — local stream is NEVER affected.
     """
     if not CLOUD_ENABLED:
         return
 
-    def push_gps(lat, lon, speed):
-        global gps_state
-        # Update local state for local UI
+    session = req_lib.Session()
+    session.headers.update({"X-Secret": PUSH_SECRET})
+
+    last_frame_push  = 0
+    last_status_push = 0
+    last_gps_push    = 0
+    last_ml_push     = 0
+
+    print(f"[CLOUD] Sender started → {CLOUD_URL}")
+
+    while True:
+        now = time.time()
+
+        # ── Push frame at max 2fps ──────────────────────────────
+        if now - last_frame_push >= 0.5:
+            frame = None
+            # Drain queue, keep only latest
+            while not frame_queue.empty():
+                try:
+                    frame = frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if frame:
+                try:
+                    r = session.post(f"{CLOUD_URL}/push/frame",
+                                     data=frame,
+                                     headers={"Content-Type": "image/jpeg"},
+                                     timeout=5)
+                    if r.status_code == 401:
+                        print("[CLOUD] ❌ Wrong PUSH_SECRET!")
+                    elif r.status_code == 200:
+                        last_frame_push = now
+                except Exception as e:
+                    print(f"[CLOUD] Frame push failed: {e}")
+
+        # ── Push ML results every 1s ────────────────────────────
+        if now - last_ml_push >= 1.0:
+            ml = None
+            while not ml_queue.empty():
+                try:
+                    ml = ml_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if ml is not None:
+                try:
+                    session.post(f"{CLOUD_URL}/push/ml",
+                                 json=ml,
+                                 timeout=5)
+                    last_ml_push = now
+                except Exception as e:
+                    print(f"[CLOUD] ML push failed: {e}")
+
+        # ── Push status every 5s ────────────────────────────────
+        if now - last_status_push >= 5.0:
+            with camera_status_lock:
+                status = camera_status
+            try:
+                session.post(f"{CLOUD_URL}/push/status",
+                             json={"status": status},
+                             timeout=5)
+                last_status_push = now
+            except Exception:
+                pass
+
+        # ── Push GPS every 5s ───────────────────────────────────
+        if now - last_gps_push >= 5.0:
+            gps = None
+            while not gps_queue.empty():
+                try:
+                    gps = gps_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if gps:
+                try:
+                    session.post(f"{CLOUD_URL}/push/gps",
+                                 json=gps,
+                                 timeout=5)
+                    last_gps_push = now
+                except Exception:
+                    pass
+
+        time.sleep(0.1)
+
+# ------------------------ GPS WORKER ------------------------
+def gps_worker():
+    def push_gps_local(lat, lon, speed):
         with gps_state_lock:
-            gps_state = {"lat": lat, "lon": lon, "speed": speed}
-        # Push to cloud
+            gps_state.update({"lat": lat, "lon": lon, "speed": speed})
         try:
-            req_lib.post(f"{CLOUD_URL}/push/gps",
-                         json={"lat": lat, "lon": lon, "speed": speed},
-                         headers=PUSH_HEADERS_JSON,
-                         timeout=3)
-            print(f"[GPS] Pushed: {lat:.5f}, {lon:.5f} @ {speed:.1f} km/h")
-        except Exception as e:
-            print(f"[GPS] Push error: {e}")
+            gps_queue.put_nowait({"lat": lat, "lon": lon, "speed": speed})
+        except queue.Full:
+            pass
 
-    # Try hardware GPS first
     try:
-        import serial
-        import pynmea2
-        print(f"[GPS] Hardware GPS found — reading from {GPS_PORT}")
-
+        import serial, pynmea2
+        print(f"[GPS] Hardware GPS — reading from {GPS_PORT}")
         while True:
             try:
                 with serial.Serial(GPS_PORT, GPS_BAUD, timeout=1) as ser:
@@ -473,32 +498,26 @@ def cloud_gps_worker():
                         if line.startswith('$GPRMC') or line.startswith('$GNRMC'):
                             try:
                                 msg = pynmea2.parse(line)
-                                if msg.status == 'A':  # A = valid GPS fix
-                                    lat   = float(msg.latitude)
-                                    lon   = float(msg.longitude)
-                                    speed = float(msg.spd_over_grnd) * 1.852  # knots → km/h
-                                    push_gps(lat, lon, speed)
+                                if msg.status == 'A':
+                                    push_gps_local(float(msg.latitude),
+                                                   float(msg.longitude),
+                                                   float(msg.spd_over_grnd) * 1.852)
                             except Exception:
                                 pass
             except Exception as e:
-                print(f"[GPS] Serial error: {e}, retrying in 5s...")
-                time.sleep(5)
+                print(f"[GPS] Serial error: {e}, retrying in 10s...")
+                time.sleep(10)
 
     except ImportError:
-        print("[GPS] pyserial/pynmea2 not installed — no hardware GPS")
-
-        # Fall back to static coordinates
         if STATIC_LAT and STATIC_LON:
-            print(f"[GPS] Using static location: {STATIC_LAT}, {STATIC_LON}")
+            print(f"[GPS] Static location: {STATIC_LAT}, {STATIC_LON}")
             while True:
-                push_gps(STATIC_LAT, STATIC_LON, 0)
-                time.sleep(10)
+                push_gps_local(STATIC_LAT, STATIC_LON, 0)
+                time.sleep(30)
         else:
-            print("[GPS] No GPS configured. Options:")
-            print("[GPS]   1. pip install pyserial pynmea2  (hardware GPS)")
-            print("[GPS]   2. Set STATIC_LAT / STATIC_LON at top of camera-server.py")
+            print("[GPS] No GPS configured — set STATIC_LAT/STATIC_LON or install pyserial pynmea2")
 
-# ------------------------ FRAME GENERATOR ------------------------
+# ------------------------ FRAME GENERATOR (LOCAL STREAM) ----
 def generate_frames():
     frame_ready.wait(timeout=15)
     last_frame  = None
@@ -529,7 +548,6 @@ def local_display_thread():
     except ImportError:
         print("tkinter not available, skipping local display")
         return
-
     try:
         root = tk.Tk()
     except Exception as e:
@@ -572,21 +590,14 @@ def local_display_thread():
     def refresh():
         with camera_status_lock:
             cam_label.config(text=f"Camera: {camera_status}")
-
         with gps_state_lock:
             g = gps_state.copy()
         if g['lat'] and g['lon']:
             spd = f"{g['speed']:.1f} km/h" if g['speed'] is not None else "—"
-            gps_label.config(
-                text=f"GPS: {g['lat']:.5f}, {g['lon']:.5f}  |  Speed: {spd}",
-                fg='#0f0'
-            )
+            gps_label.config(text=f"GPS: {g['lat']:.5f}, {g['lon']:.5f} | {spd}", fg='#0f0')
         else:
             gps_label.config(text="GPS: No fix yet", fg='#555')
-
-        cloud_label.config(
-            text=f"Cloud: {'PUSHING → ' + CLOUD_URL if CLOUD_ENABLED else 'DISABLED'}"
-        )
+        cloud_label.config(text=f"Cloud: {'ON → ' + CLOUD_URL if CLOUD_ENABLED else 'OFF'}")
 
         if ml_detection_enabled:
             status_label.config(text="ML Detection: ON", fg='lime')
@@ -613,7 +624,7 @@ def local_display_thread():
     root.after(500, refresh)
     root.mainloop()
 
-# ------------------------ FLASK ROUTES (LOCAL) ------------------------
+# ------------------------ FLASK ROUTES ------------------------
 @app.route('/stream')
 def stream():
     return Response(generate_frames(),
@@ -712,9 +723,9 @@ def index():
 
 <div id="gpsbox">
   <h2>📍 GPS Location</h2>
-  <div class="grow"><span class="glabel">Latitude:</span>   <span class="gval" id="glat">—</span></div>
-  <div class="grow"><span class="glabel">Longitude:</span>  <span class="gval" id="glon">—</span></div>
-  <div class="grow"><span class="glabel">Speed:</span>      <span class="gval" id="gspd">—</span></div>
+  <div class="grow"><span class="glabel">Latitude:</span>  <span class="gval" id="glat">—</span></div>
+  <div class="grow"><span class="glabel">Longitude:</span> <span class="gval" id="glon">—</span></div>
+  <div class="grow"><span class="glabel">Speed:</span>     <span class="gval" id="gspd">—</span></div>
   <div id="noloc">Waiting for GPS...</div>
 </div>
 <div id="map"></div>
@@ -725,15 +736,14 @@ let colorEnabled=false, mlEnabled=false, mlInterval=null, lastStatus='', streamR
 let map=null, marker=null;
 
 function toggleDetection() {
-  colorEnabled = !colorEnabled;
+  colorEnabled=!colorEnabled;
   fetch('/detection',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({enabled:colorEnabled,mode:'center'})});
   document.getElementById('btnColor').classList.toggle('active',colorEnabled);
   document.getElementById('status').innerText='Color Detection: '+(colorEnabled?'ON':'OFF');
 }
-
 function toggleML() {
-  mlEnabled = !mlEnabled;
+  mlEnabled=!mlEnabled;
   fetch('/ml',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({enabled:mlEnabled})});
   document.getElementById('btnML').classList.toggle('active',mlEnabled);
@@ -741,7 +751,6 @@ function toggleML() {
   if(mlInterval) clearInterval(mlInterval);
   if(mlEnabled) mlInterval=setInterval(updateML,1000);
 }
-
 function updateML() {
   fetch('/ml_results').then(r=>r.json()).then(d=>{
     let t='ML: ';
@@ -753,16 +762,14 @@ function updateML() {
     if(t!==lastStatus){lastStatus=t;document.getElementById('status').innerText=t;}
   }).catch(()=>{document.getElementById('status').innerText='ML: Connection error';});
 }
-
 setInterval(()=>{
   fetch('/status').then(r=>r.json()).then(d=>{
     document.getElementById('camstatus').innerText='Camera: '+d.camera_status;
   }).catch(()=>{});
-}, 2000);
-
-function updateGPS() {
+},2000);
+function updateGPS(){
   fetch('/gps').then(r=>r.json()).then(d=>{
-    if(d.lat && d.lon){
+    if(d.lat&&d.lon){
       document.getElementById('noloc').style.display='none';
       document.getElementById('glat').innerText=d.lat.toFixed(6)+'°';
       document.getElementById('glon').innerText=d.lon.toFixed(6)+'°';
@@ -777,26 +784,18 @@ function updateGPS() {
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
           {attribution:'© OpenStreetMap'}).addTo(map);
         marker=L.marker([d.lat,d.lon]).addTo(map).bindPopup('Pi Location').openPopup();
-      } else {
-        marker.setLatLng([d.lat,d.lon]);
-        map.setView([d.lat,d.lon]);
-      }
+      } else { marker.setLatLng([d.lat,d.lon]); map.setView([d.lat,d.lon]); }
     }
   }).catch(()=>{});
 }
-setInterval(updateGPS,3000);
-updateGPS();
+setInterval(updateGPS,3000); updateGPS();
 
 const streamEl=document.getElementById('stream');
 streamEl.onerror=function(){
   streamRetries++;
   const delay=Math.min(10000,streamRetries*1500);
-  document.getElementById('reconnect-msg').innerText=
-    'Stream lost. Reconnecting in '+(delay/1000).toFixed(1)+'s...';
-  setTimeout(()=>{
-    streamEl.src='/stream?t='+Date.now();
-    document.getElementById('reconnect-msg').innerText='';
-  }, delay);
+  document.getElementById('reconnect-msg').innerText='Stream lost. Reconnecting in '+(delay/1000).toFixed(1)+'s...';
+  setTimeout(()=>{streamEl.src='/stream?t='+Date.now();document.getElementById('reconnect-msg').innerText='';},delay);
 };
 streamEl.onload=function(){streamRetries=0;document.getElementById('reconnect-msg').innerText='';};
 </script>
@@ -818,17 +817,12 @@ if __name__ == "__main__":
 
     local_ip = get_local_ip()
 
-    # Local workers
     threading.Thread(target=camera_thread,        daemon=True).start()
     threading.Thread(target=overlay_worker,       daemon=True).start()
     threading.Thread(target=ml_worker,            daemon=True).start()
     threading.Thread(target=local_display_thread, daemon=True).start()
-
-    # Cloud push workers
-    threading.Thread(target=cloud_frame_worker,   daemon=True).start()
-    threading.Thread(target=cloud_ml_worker,      daemon=True).start()
-    threading.Thread(target=cloud_status_worker,  daemon=True).start()
-    threading.Thread(target=cloud_gps_worker,     daemon=True).start()
+    threading.Thread(target=cloud_sender,         daemon=True).start()  # single cloud thread
+    threading.Thread(target=gps_worker,           daemon=True).start()
 
     frame_ready.wait(timeout=15)
 
