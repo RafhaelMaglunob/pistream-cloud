@@ -12,35 +12,47 @@ app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # ------------------------ CLOUD CONFIG ------------------------
-# ⚠️  CHANGE THESE to match your Render deployment
-CLOUD_URL    = "https://YOUR-APP-NAME.onrender.com"  # ← your Render URL
-PUSH_SECRET  = "changeme123"                          # ← must match render.yaml PUSH_SECRET
-CLOUD_ENABLED = True                                  # ← set False to disable cloud push
+CLOUD_URL     = "https://pistream-cloud.onrender.com"  # ← your Render URL
+PUSH_SECRET   = "Rafhael@1"                            # ← must match Render env var
+CLOUD_ENABLED = True
 
 PUSH_HEADERS_FRAME = {"X-Secret": PUSH_SECRET, "Content-Type": "image/jpeg"}
 PUSH_HEADERS_JSON  = {"X-Secret": PUSH_SECRET, "Content-Type": "application/json"}
 
+# ------------------------ GPS CONFIG --------------------------
+# Option A: No GPS hardware → set your fixed location here
+STATIC_LAT = None   # e.g. 14.5995
+STATIC_LON = None   # e.g. 120.9842
+
+# Option B: Hardware GPS (NEO-6M etc.) → install: pip install pyserial pynmea2
+GPS_PORT = "/dev/ttyAMA0"
+GPS_BAUD = 9600
+
 # ------------------------ GLOBALS ------------------------
 latest_frame = None
-first_frame = None
-frame_lock = threading.Lock()
-frame_ready = threading.Event()
+first_frame  = None
+frame_lock   = threading.Lock()
+frame_ready  = threading.Event()
 
 latest_overlay_frame = None
 overlay_lock = threading.Lock()
 
 color_detection_enabled = False
-detection_mode = 'center'
+detection_mode  = 'center'
 detected_colors = []
-detection_lock = threading.Lock()
+detection_lock  = threading.Lock()
 
 ml_detection_enabled = False
-ml_lock = threading.Lock()
+ml_lock    = threading.Lock()
 ml_results = []
-model = None
+model      = None
 
-camera_status = "Starting..."
+camera_status      = "Starting..."
 camera_status_lock = threading.Lock()
+
+# Shared GPS state (updated by GPS worker, read by local Flask UI)
+gps_state      = {"lat": None, "lon": None, "speed": None}
+gps_state_lock = threading.Lock()
 
 # ------------------------ UTILS ------------------------
 def get_local_ip():
@@ -127,7 +139,7 @@ def detect_colors_in_frame(frame_bytes, mode='center'):
         print(f"Color detection error: {e}")
 
 # ------------------------ ML DETECTION ------------------------
-CRASH_LABEL = 'motor_crash'
+CRASH_LABEL          = 'motor_crash'
 CRASH_CONF_THRESHOLD = 0.90
 
 def detect_accidents_in_frame(frame_bytes):
@@ -147,7 +159,7 @@ def detect_accidents_in_frame(frame_bytes):
                 if float(conf) < CRASH_CONF_THRESHOLD:
                     continue
                 x1, y1, x2, y2 = map(int, box.tolist())
-                cx = (x1+x2)//2
+                cx   = (x1+x2)//2
                 side = 'Left' if cx < w/3 else ('Center' if cx < w*2/3 else 'Right')
                 boxes.append({
                     'box': [x1, y1, x2, y2],
@@ -163,7 +175,7 @@ def detect_accidents_in_frame(frame_bytes):
 # ------------------------ OVERLAY ------------------------
 def add_overlay(frame_bytes, mode='center'):
     try:
-        img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
+        img  = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
         draw = ImageDraw.Draw(img, 'RGBA')
         font = ImageFont.load_default()
 
@@ -172,8 +184,8 @@ def add_overlay(frame_bytes, mode='center'):
         for color in colors:
             x, y = color['coords']
             if mode == 'center':
-                draw.line([(x-20, y), (x+20, y)], fill=(0, 255, 0, 255), width=2)
-                draw.line([(x, y-20), (x, y+20)], fill=(0, 255, 0, 255), width=2)
+                draw.line([(x-20, y), (x+20, y)], fill=(0,255,0,255), width=2)
+                draw.line([(x, y-20), (x, y+20)], fill=(0,255,0,255), width=2)
             elif mode == 'grid':
                 draw.ellipse([x-10, y-10, x+10, y+10],
                              fill=(color['r'], color['g'], color['b'], 255))
@@ -182,9 +194,9 @@ def add_overlay(frame_bytes, mode='center'):
             boxes = ml_results.copy()
         for b in boxes:
             x1, y1, x2, y2 = b['box']
-            draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0, 255), width=2)
+            draw.rectangle([x1, y1, x2, y2], outline=(255,0,0,255), width=2)
             text = f"{b['label']} {b['conf']*100:.0f}% {b['side']}"
-            draw.text((x1, max(0, y1-10)), text, fill=(255, 0, 0, 255), font=font)
+            draw.text((x1, max(0, y1-10)), text, fill=(255,0,0,255), font=font)
 
         out = io.BytesIO()
         img.save(out, format='JPEG', quality=85)
@@ -195,7 +207,6 @@ def add_overlay(frame_bytes, mode='center'):
 
 # ------------------------ CAMERA THREAD ------------------------
 def kill_existing_camera():
-    """Kill any existing rpicam-vid processes to free the camera device."""
     try:
         subprocess.run(['pkill', '-f', 'rpicam-vid'], capture_output=True)
         time.sleep(1)
@@ -204,9 +215,8 @@ def kill_existing_camera():
 
 def camera_thread():
     global latest_frame, first_frame, latest_overlay_frame
-
     restart_delay = 2
-    max_delay = 15
+    max_delay     = 15
     consecutive_failures = 0
 
     while True:
@@ -241,7 +251,6 @@ def camera_thread():
             EOI = b'\xff\xd9'
             buffer = b''
             last_frame_time = time.time()
-
             set_camera_status("Camera started, waiting for first frame...")
 
             while True:
@@ -270,26 +279,24 @@ def camera_thread():
                 buffer += chunk
 
                 if len(buffer) > 4 * 1024 * 1024:
-                    set_camera_status("Buffer overflow (4MB), resetting buffer...")
+                    set_camera_status("Buffer overflow, resetting...")
                     buffer = b''
                     continue
 
                 while True:
                     soi = buffer.find(SOI)
-                    if soi == -1:
-                        break
+                    if soi == -1: break
                     eoi = buffer.find(EOI, soi + 2)
-                    if eoi == -1:
-                        break
+                    if eoi == -1: break
 
-                    frame = buffer[soi:eoi + 2]
+                    frame  = buffer[soi:eoi + 2]
                     buffer = buffer[eoi + 2:]
 
                     if len(frame) < 1024:
                         print(f"[CAMERA] Skipping tiny frame ({len(frame)} bytes)")
                         continue
 
-                    last_frame_time = time.time()
+                    last_frame_time  = time.time()
                     frames_captured += 1
 
                     with frame_lock:
@@ -303,23 +310,19 @@ def camera_thread():
                         set_camera_status(f"Running OK — {frames_captured} frames captured")
 
         except FileNotFoundError:
-            set_camera_status("ERROR: rpicam-vid not found! Is libcamera installed?")
+            set_camera_status("ERROR: rpicam-vid not found!")
             time.sleep(10)
             continue
-
         except Exception as e:
             set_camera_status(f"Unexpected camera error: {e}")
-
         finally:
             if process:
                 try:
                     process.terminate()
                     process.wait(timeout=3)
                 except Exception:
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
+                    try: process.kill()
+                    except Exception: pass
 
         if frames_captured == 0:
             consecutive_failures += 1
@@ -328,22 +331,19 @@ def camera_thread():
             restart_delay = 2
 
         restart_delay = min(max_delay, 2 * (consecutive_failures + 1))
-        set_camera_status(f"Restarting camera in {restart_delay}s (failures: {consecutive_failures})...")
+        set_camera_status(f"Restarting in {restart_delay}s (failures: {consecutive_failures})...")
         time.sleep(restart_delay)
 
 # ------------------------ DETECTION WORKERS ------------------------
 def overlay_worker():
-    """Runs at ~15fps — only does color detection + overlay rendering."""
     global latest_overlay_frame
     last_processed = None
-    color_skip = 0
+    color_skip     = 0
 
     while True:
         time.sleep(0.066)
-
         with frame_lock:
             frame = latest_frame
-
         if frame is None or frame is last_processed:
             continue
         last_processed = frame
@@ -357,35 +357,27 @@ def overlay_worker():
             latest_overlay_frame = rendered
 
 def ml_worker():
-    """Runs ML inference in its own thread so it never stalls the stream."""
     last_processed = None
-
     while True:
         time.sleep(0.5)
-
         if not ml_detection_enabled:
             continue
-
         with frame_lock:
             frame = latest_frame
-
         if frame is None or frame is last_processed:
             continue
         last_processed = frame
-
         detect_accidents_in_frame(frame)
 
 # ------------------------ CLOUD PUSH WORKERS ------------------------
 def cloud_frame_worker():
-    """Pushes overlay frames to Render cloud at ~2fps."""
     if not CLOUD_ENABLED:
         return
     last_pushed = None
     print(f"[CLOUD] Frame pusher started → {CLOUD_URL}")
 
     while True:
-        time.sleep(0.5)  # 2fps — friendly for free tier
-
+        time.sleep(0.5)  # 2fps
         with overlay_lock:
             frame = latest_overlay_frame
         if frame is None:
@@ -396,74 +388,120 @@ def cloud_frame_worker():
         last_pushed = frame
 
         try:
-            r = req_lib.post(
-                f"{CLOUD_URL}/push/frame",
-                data=frame,
-                headers=PUSH_HEADERS_FRAME,
-                timeout=3
-            )
+            r = req_lib.post(f"{CLOUD_URL}/push/frame",
+                             data=frame,
+                             headers=PUSH_HEADERS_FRAME,
+                             timeout=3)
             if r.status_code == 401:
-                print("[CLOUD] ❌ Wrong PUSH_SECRET — check CLOUD CONFIG at top of file!")
+                print("[CLOUD] ❌ Wrong PUSH_SECRET!")
         except req_lib.exceptions.ConnectionError:
-            print("[CLOUD] ⚠️  Render unreachable (may be waking up, retrying...)")
+            print("[CLOUD] ⚠️  Render unreachable, retrying...")
         except req_lib.exceptions.Timeout:
             print("[CLOUD] ⚠️  Frame push timed out")
         except Exception as e:
             print(f"[CLOUD] Frame error: {e}")
 
-
 def cloud_ml_worker():
-    """Pushes ML detection results to Render every second."""
     if not CLOUD_ENABLED:
         return
     last_pushed = None
-
     while True:
         time.sleep(1)
-
         with ml_lock:
             results = ml_results.copy()
-
         if results == last_pushed:
             continue
         last_pushed = results
-
         try:
-            req_lib.post(
-                f"{CLOUD_URL}/push/ml",
-                json=results,
-                headers=PUSH_HEADERS_JSON,
-                timeout=3
-            )
+            req_lib.post(f"{CLOUD_URL}/push/ml",
+                         json=results,
+                         headers=PUSH_HEADERS_JSON,
+                         timeout=3)
         except Exception as e:
             print(f"[CLOUD] ML push error: {e}")
 
-
 def cloud_status_worker():
-    """Pushes camera status to Render every 3 seconds."""
+    if not CLOUD_ENABLED:
+        return
+    while True:
+        time.sleep(3)
+        with camera_status_lock:
+            status = camera_status
+        try:
+            req_lib.post(f"{CLOUD_URL}/push/status",
+                         json={"status": status},
+                         headers=PUSH_HEADERS_JSON,
+                         timeout=3)
+        except Exception as e:
+            print(f"[CLOUD] Status push error: {e}")
+
+def cloud_gps_worker():
+    """
+    Pushes GPS to Render. Supports:
+      - Hardware GPS module (NEO-6M via serial): pip install pyserial pynmea2
+      - Static coordinates: set STATIC_LAT / STATIC_LON at top of file
+    """
     if not CLOUD_ENABLED:
         return
 
-    while True:
-        time.sleep(3)
-
-        with camera_status_lock:
-            status = camera_status
-
+    def push_gps(lat, lon, speed):
+        global gps_state
+        # Update local state for local UI
+        with gps_state_lock:
+            gps_state = {"lat": lat, "lon": lon, "speed": speed}
+        # Push to cloud
         try:
-            req_lib.post(
-                f"{CLOUD_URL}/push/status",
-                json={"status": status},
-                headers=PUSH_HEADERS_JSON,
-                timeout=3
-            )
+            req_lib.post(f"{CLOUD_URL}/push/gps",
+                         json={"lat": lat, "lon": lon, "speed": speed},
+                         headers=PUSH_HEADERS_JSON,
+                         timeout=3)
+            print(f"[GPS] Pushed: {lat:.5f}, {lon:.5f} @ {speed:.1f} km/h")
         except Exception as e:
-            print(f"[CLOUD] Status push error: {e}")
+            print(f"[GPS] Push error: {e}")
+
+    # Try hardware GPS first
+    try:
+        import serial
+        import pynmea2
+        print(f"[GPS] Hardware GPS found — reading from {GPS_PORT}")
+
+        while True:
+            try:
+                with serial.Serial(GPS_PORT, GPS_BAUD, timeout=1) as ser:
+                    while True:
+                        line = ser.readline().decode('ascii', errors='replace').strip()
+                        if line.startswith('$GPRMC') or line.startswith('$GNRMC'):
+                            try:
+                                msg = pynmea2.parse(line)
+                                if msg.status == 'A':  # A = valid GPS fix
+                                    lat   = float(msg.latitude)
+                                    lon   = float(msg.longitude)
+                                    speed = float(msg.spd_over_grnd) * 1.852  # knots → km/h
+                                    push_gps(lat, lon, speed)
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"[GPS] Serial error: {e}, retrying in 5s...")
+                time.sleep(5)
+
+    except ImportError:
+        print("[GPS] pyserial/pynmea2 not installed — no hardware GPS")
+
+        # Fall back to static coordinates
+        if STATIC_LAT and STATIC_LON:
+            print(f"[GPS] Using static location: {STATIC_LAT}, {STATIC_LON}")
+            while True:
+                push_gps(STATIC_LAT, STATIC_LON, 0)
+                time.sleep(10)
+        else:
+            print("[GPS] No GPS configured. Options:")
+            print("[GPS]   1. pip install pyserial pynmea2  (hardware GPS)")
+            print("[GPS]   2. Set STATIC_LAT / STATIC_LON at top of camera-server.py")
 
 # ------------------------ FRAME GENERATOR ------------------------
 def generate_frames():
     frame_ready.wait(timeout=15)
-    last_frame = None
+    last_frame  = None
     stall_count = 0
 
     while True:
@@ -475,21 +513,14 @@ def generate_frames():
 
         if frame is None or frame is last_frame:
             stall_count += 1
-            if stall_count > 450:  # ~15s stall → drop dead client
+            if stall_count > 450:
                 return
-            if stall_count % 30 == 0:
-                print(f"[STREAM] Stalled for ~{stall_count * 0.033:.1f}s waiting for new frame...")
             time.sleep(0.033)
             continue
 
         stall_count = 0
-        last_frame = frame
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n'
-            + frame +
-            b'\r\n'
-        )
+        last_frame  = frame
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
 # ------------------------ LOCAL PI DISPLAY ------------------------
 def local_display_thread():
@@ -502,42 +533,56 @@ def local_display_thread():
     try:
         root = tk.Tk()
     except Exception as e:
-        print(f"No display available for local monitor: {e}")
+        print(f"No display available: {e}")
         return
 
     root.title("Pi ML Monitor")
     root.configure(bg='black')
-    root.geometry("520x360")
+    root.geometry("520x420")
     root.attributes('-topmost', True)
 
     tk.Label(root, text="ACCIDENT DETECTION MONITOR",
-             bg='black', fg='lime', font=('Courier', 14, 'bold')).pack(pady=10)
+             bg='black', fg='lime', font=('Courier', 14, 'bold')).pack(pady=8)
 
     result_label = tk.Label(root, text="Waiting for detections...",
                             bg='black', fg='lime', font=('Courier', 12),
                             wraplength=500, justify='left')
-    result_label.pack(pady=5, padx=10)
+    result_label.pack(pady=4, padx=10)
 
-    acc_label = tk.Label(root, text="",
-                         bg='black', fg='yellow', font=('Courier', 18, 'bold'))
-    acc_label.pack(pady=5)
+    acc_label = tk.Label(root, text="", bg='black', fg='yellow',
+                         font=('Courier', 18, 'bold'))
+    acc_label.pack(pady=4)
 
     status_label = tk.Label(root, text="ML Detection: OFF",
                             bg='black', fg='gray', font=('Courier', 10))
-    status_label.pack(pady=5)
+    status_label.pack(pady=4)
 
-    cam_label = tk.Label(root, text="",
-                         bg='black', fg='cyan', font=('Courier', 9),
-                         wraplength=500)
+    cam_label = tk.Label(root, text="", bg='black', fg='cyan',
+                         font=('Courier', 9), wraplength=500)
     cam_label.pack(pady=2, padx=10)
 
-    cloud_label = tk.Label(root, text="",
-                           bg='black', fg='#0af', font=('Courier', 9))
+    gps_label = tk.Label(root, text="GPS: waiting...",
+                         bg='black', fg='#0f0', font=('Courier', 9), wraplength=500)
+    gps_label.pack(pady=2, padx=10)
+
+    cloud_label = tk.Label(root, text="", bg='black', fg='#0af',
+                           font=('Courier', 9))
     cloud_label.pack(pady=2, padx=10)
 
     def refresh():
         with camera_status_lock:
             cam_label.config(text=f"Camera: {camera_status}")
+
+        with gps_state_lock:
+            g = gps_state.copy()
+        if g['lat'] and g['lon']:
+            spd = f"{g['speed']:.1f} km/h" if g['speed'] is not None else "—"
+            gps_label.config(
+                text=f"GPS: {g['lat']:.5f}, {g['lon']:.5f}  |  Speed: {spd}",
+                fg='#0f0'
+            )
+        else:
+            gps_label.config(text="GPS: No fix yet", fg='#555')
 
         cloud_label.config(
             text=f"Cloud: {'PUSHING → ' + CLOUD_URL if CLOUD_ENABLED else 'DISABLED'}"
@@ -551,10 +596,7 @@ def local_display_thread():
                 result_label.config(text="No detections", fg='lime')
                 acc_label.config(text="")
             else:
-                lines = []
-                for b in boxes:
-                    acc = b['conf'] * 100
-                    lines.append(f"  {b['label']}  |  {b['side']}  |  Accuracy: {acc:.1f}%")
+                lines = [f"  {b['label']}  |  {b['side']}  |  {b['conf']*100:.1f}%" for b in boxes]
                 result_label.config(text='\n'.join(lines), fg='white')
                 best = max(boxes, key=lambda x: x['conf'])
                 acc_label.config(
@@ -571,13 +613,11 @@ def local_display_thread():
     root.after(500, refresh)
     root.mainloop()
 
-# ------------------------ FLASK ROUTES ------------------------
+# ------------------------ FLASK ROUTES (LOCAL) ------------------------
 @app.route('/stream')
 def stream():
-    return Response(
-        generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/snapshot.jpg')
 def snapshot():
@@ -624,116 +664,141 @@ def get_status():
     with camera_status_lock:
         return jsonify({'camera_status': camera_status})
 
+@app.route('/gps')
+def get_gps():
+    with gps_state_lock:
+        return jsonify(gps_state)
+
 @app.route('/')
 def index():
     html = '''<!DOCTYPE html>
 <html>
 <head>
-<title>Pi Camera + ML</title>
+<title>Pi Camera + ML (Local)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body { background: #000; color: #0f0; font-family: monospace; text-align: center; }
-  #stream { border: 2px solid #0f0; width: 640px; }
-  .btn { background: #111; color: #0f0; border: 2px solid #0f0; padding: 10px; margin: 5px; cursor: pointer; }
-  .btn:hover { background: #0f0; color: #000; }
-  .btn.active { background: #0f0; color: #000; }
-  #status { margin-top: 10px; font-size: 14px; min-height: 24px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #000; color: #0f0; font-family: monospace; text-align: center; padding: 10px; }
+  h1 { font-size: 18px; margin: 10px 0; }
+  #stream { border: 2px solid #0f0; max-width: 100%; width: 640px; display: block; margin: 0 auto 10px; }
+  .btn { background: #111; color: #0f0; border: 2px solid #0f0; padding: 10px;
+         margin: 5px; cursor: pointer; font-family: monospace; }
+  .btn:hover, .btn.active { background: #0f0; color: #000; }
+  #status    { margin-top: 10px; font-size: 14px; min-height: 24px; }
   #camstatus { font-size: 11px; color: #0aa; margin-top: 4px; }
-  #fps { font-size: 11px; color: #555; margin-top: 4px; }
   #reconnect-msg { color: #f80; font-size: 12px; min-height: 18px; }
+  #gpsbox { border: 1px solid #0a0; background: #001a00; margin: 12px auto;
+            width: 640px; max-width: 100%; padding: 10px; text-align: left; }
+  #gpsbox h2 { font-size: 13px; margin-bottom: 8px; }
+  .grow { display: flex; justify-content: space-between; font-size: 12px; margin: 3px 0; }
+  .glabel { color: #0a0; } .gval { color: #fff; font-weight: bold; }
+  #map { width: 640px; max-width: 100%; height: 280px; margin: 8px auto;
+         border: 1px solid #0a0; display: none; }
+  #maplink { font-size: 11px; color: #0af; display: none; margin: 4px auto; }
+  #noloc { font-size: 12px; color: #555; padding: 4px 0; }
 </style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
 <h1>Pi Camera + Accident Detection (Local)</h1>
-<img id="stream" src="/stream"><br>
+<img id="stream" src="/stream">
 <div id="reconnect-msg"></div>
+<br>
 <button class="btn" id="btnColor" onclick="toggleDetection()">Toggle Color Detection</button>
-<button class="btn" id="btnML" onclick="toggleML()">Toggle ML Detection</button>
+<button class="btn" id="btnML"    onclick="toggleML()">Toggle ML Detection</button>
 <div id="status">Status: Ready</div>
 <div id="camstatus">Camera: -</div>
-<div id="fps"></div>
+
+<div id="gpsbox">
+  <h2>📍 GPS Location</h2>
+  <div class="grow"><span class="glabel">Latitude:</span>   <span class="gval" id="glat">—</span></div>
+  <div class="grow"><span class="glabel">Longitude:</span>  <span class="gval" id="glon">—</span></div>
+  <div class="grow"><span class="glabel">Speed:</span>      <span class="gval" id="gspd">—</span></div>
+  <div id="noloc">Waiting for GPS...</div>
+</div>
+<div id="map"></div>
+<a id="maplink" href="#" target="_blank">📌 Open in Google Maps</a>
+
 <script>
-let colorEnabled = false;
-let mlEnabled = false;
-let mlInterval = null;
-let statusInterval = null;
-let lastStatus = '';
-let streamRetries = 0;
+let colorEnabled=false, mlEnabled=false, mlInterval=null, lastStatus='', streamRetries=0;
+let map=null, marker=null;
 
 function toggleDetection() {
-    colorEnabled = !colorEnabled;
-    fetch('/detection', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: colorEnabled, mode: 'center' })
-    });
-    document.getElementById('btnColor').classList.toggle('active', colorEnabled);
-    document.getElementById('status').innerText = 'Color Detection: ' + (colorEnabled ? 'ON' : 'OFF');
+  colorEnabled = !colorEnabled;
+  fetch('/detection',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({enabled:colorEnabled,mode:'center'})});
+  document.getElementById('btnColor').classList.toggle('active',colorEnabled);
+  document.getElementById('status').innerText='Color Detection: '+(colorEnabled?'ON':'OFF');
 }
 
 function toggleML() {
-    mlEnabled = !mlEnabled;
-    fetch('/ml', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: mlEnabled })
-    });
-    document.getElementById('btnML').classList.toggle('active', mlEnabled);
-    document.getElementById('status').innerText = 'ML Detection: ' + (mlEnabled ? 'ON' : 'OFF');
-    if (mlInterval) clearInterval(mlInterval);
-    if (mlEnabled) {
-        mlInterval = setInterval(updateML, 1000);
-    } else {
-        lastStatus = '';
-        document.getElementById('fps').innerText = '';
-    }
+  mlEnabled = !mlEnabled;
+  fetch('/ml',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({enabled:mlEnabled})});
+  document.getElementById('btnML').classList.toggle('active',mlEnabled);
+  document.getElementById('status').innerText='ML Detection: '+(mlEnabled?'ON':'OFF');
+  if(mlInterval) clearInterval(mlInterval);
+  if(mlEnabled) mlInterval=setInterval(updateML,1000);
 }
 
 function updateML() {
-    fetch('/ml_results').then(r => r.json()).then(data => {
-        let text = 'ML: ';
-        if (data.ml_results.length === 0) {
-            text += 'No detections';
-        } else {
-            data.ml_results.forEach(m => {
-                let acc = (m.conf * 100).toFixed(1);
-                text += m.label + ' (' + m.side + ') — Accuracy: ' + acc + '% | ';
-            });
-            text = text.slice(0, -3);
-        }
-        if (text !== lastStatus) {
-            lastStatus = text;
-            document.getElementById('status').innerText = text;
-        }
-    }).catch(() => {
-        document.getElementById('status').innerText = 'ML: Connection error';
+  fetch('/ml_results').then(r=>r.json()).then(d=>{
+    let t='ML: ';
+    if(!d.ml_results.length) t+='No detections';
+    else d.ml_results.forEach(m=>{
+      t+=m.label+' ('+m.side+') — '+(m.conf*100).toFixed(1)+'% | ';
     });
+    t=t.replace(/ \| $/,'');
+    if(t!==lastStatus){lastStatus=t;document.getElementById('status').innerText=t;}
+  }).catch(()=>{document.getElementById('status').innerText='ML: Connection error';});
 }
 
-function updateCamStatus() {
-    fetch('/status').then(r => r.json()).then(data => {
-        document.getElementById('camstatus').innerText = 'Camera: ' + data.camera_status;
-    }).catch(() => {});
+setInterval(()=>{
+  fetch('/status').then(r=>r.json()).then(d=>{
+    document.getElementById('camstatus').innerText='Camera: '+d.camera_status;
+  }).catch(()=>{});
+}, 2000);
+
+function updateGPS() {
+  fetch('/gps').then(r=>r.json()).then(d=>{
+    if(d.lat && d.lon){
+      document.getElementById('noloc').style.display='none';
+      document.getElementById('glat').innerText=d.lat.toFixed(6)+'°';
+      document.getElementById('glon').innerText=d.lon.toFixed(6)+'°';
+      document.getElementById('gspd').innerText=d.speed!=null?d.speed.toFixed(1)+' km/h':'—';
+      const ml=document.getElementById('maplink');
+      ml.style.display='block';
+      ml.href='https://maps.google.com/?q='+d.lat+','+d.lon;
+      const mapEl=document.getElementById('map');
+      mapEl.style.display='block';
+      if(!map){
+        map=L.map('map').setView([d.lat,d.lon],16);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+          {attribution:'© OpenStreetMap'}).addTo(map);
+        marker=L.marker([d.lat,d.lon]).addTo(map).bindPopup('Pi Location').openPopup();
+      } else {
+        marker.setLatLng([d.lat,d.lon]);
+        map.setView([d.lat,d.lon]);
+      }
+    }
+  }).catch(()=>{});
 }
+setInterval(updateGPS,3000);
+updateGPS();
 
-const streamEl = document.getElementById('stream');
-streamEl.onerror = function() {
-    streamRetries++;
-    const delay = Math.min(10000, streamRetries * 1500);
-    document.getElementById('reconnect-msg').innerText =
-        'Stream lost. Reconnecting in ' + (delay/1000).toFixed(1) + 's... (attempt ' + streamRetries + ')';
-    setTimeout(() => {
-        streamEl.src = '/stream?t=' + Date.now();
-        document.getElementById('reconnect-msg').innerText = 'Reconnecting...';
-    }, delay);
+const streamEl=document.getElementById('stream');
+streamEl.onerror=function(){
+  streamRetries++;
+  const delay=Math.min(10000,streamRetries*1500);
+  document.getElementById('reconnect-msg').innerText=
+    'Stream lost. Reconnecting in '+(delay/1000).toFixed(1)+'s...';
+  setTimeout(()=>{
+    streamEl.src='/stream?t='+Date.now();
+    document.getElementById('reconnect-msg').innerText='';
+  }, delay);
 };
-
-streamEl.onload = function() {
-    streamRetries = 0;
-    document.getElementById('reconnect-msg').innerText = '';
-};
-
-statusInterval = setInterval(updateCamStatus, 2000);
-updateCamStatus();
+streamEl.onload=function(){streamRetries=0;document.getElementById('reconnect-msg').innerText='';};
 </script>
 </body>
 </html>'''
@@ -754,15 +819,16 @@ if __name__ == "__main__":
     local_ip = get_local_ip()
 
     # Local workers
-    threading.Thread(target=camera_thread,      daemon=True).start()
-    threading.Thread(target=overlay_worker,     daemon=True).start()
-    threading.Thread(target=ml_worker,          daemon=True).start()
+    threading.Thread(target=camera_thread,        daemon=True).start()
+    threading.Thread(target=overlay_worker,       daemon=True).start()
+    threading.Thread(target=ml_worker,            daemon=True).start()
     threading.Thread(target=local_display_thread, daemon=True).start()
 
     # Cloud push workers
-    threading.Thread(target=cloud_frame_worker,  daemon=True).start()
-    threading.Thread(target=cloud_ml_worker,     daemon=True).start()
-    threading.Thread(target=cloud_status_worker, daemon=True).start()
+    threading.Thread(target=cloud_frame_worker,   daemon=True).start()
+    threading.Thread(target=cloud_ml_worker,      daemon=True).start()
+    threading.Thread(target=cloud_status_worker,  daemon=True).start()
+    threading.Thread(target=cloud_gps_worker,     daemon=True).start()
 
     frame_ready.wait(timeout=15)
 
