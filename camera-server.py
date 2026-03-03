@@ -16,6 +16,13 @@ import colorsys
 import torch
 from ultralytics import YOLO
 import requests as req_lib
+import asyncio
+import websockets
+import threading
+import json
+
+webrtc_active = False
+ws_server = None
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
@@ -529,6 +536,54 @@ def generate_combined():
             time.sleep(0.033); continue
         stall=0; last=frame
         yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame+b'\r\n'
+
+def start_webrtc_signaling():
+    """Start WebSocket server for WebRTC signaling"""
+    global ws_server
+    
+    async def signaling_handler(websocket):
+        global webrtc_active
+        print("[WebRTC] Client connected for signaling")
+        
+        try:
+            async for message in websocket:
+                data = json.loads(message)
+                
+                if data['type'] == 'offer':
+                    print("[WebRTC] Received offer, sending to browser...")
+                    # Forward to browser via relay
+                    await websocket.send(json.dumps({
+                        'type': 'offer',
+                        'sdp': data['sdp']
+                    }))
+                    
+                elif data['type'] == 'answer':
+                    print("[WebRTC] Received answer from browser")
+                    webrtc_active = True
+                    
+                elif data['type'] == 'ice':
+                    # Forward ICE candidates
+                    pass
+                    
+        except Exception as e:
+            print(f"[WebRTC] Error: {e}")
+        finally:
+            webrtc_active = False
+            print("[WebRTC] Client disconnected")
+    
+    async def start_server():
+        global ws_server
+        ws_server = await websockets.serve(signaling_handler, "0.0.0.0", 8765)
+        print("[WebRTC] Signaling server running on ws://0.0.0.0:8765")
+        await ws_server.wait_closed()
+    
+    def run_server():
+        asyncio.new_event_loop().run_until_complete(start_server())
+    
+    threading.Thread(target=run_server, daemon=True).start()
+
+# Add this line in your main() function after other threads:
+start_webrtc_signaling()
 
 # ─────────────────── ROUTES ─────────────────────────
 @app.route('/stream')

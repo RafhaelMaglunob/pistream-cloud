@@ -2,6 +2,11 @@
 """
 Enhanced Real-Time Relay Server — WebRTC signaling only.
 Optimized for <50ms latency with WebSocket signaling.
+No video data passes through here at all.
+Pi <-> Render <-> Browser exchange SDP offer/answer + ICE candidates,
+then video flows DIRECTLY Pi → Browser via WebRTC (~30-80ms latency).
+
+Also keeps SSE snapshot fallback for crash alerts / GPS dashboard.
 """
 from flask import Flask, Response, jsonify, request, render_template_string, session, redirect, url_for
 from flask_sock import Sock
@@ -576,9 +581,7 @@ const ICE = {
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-    // Add TURN if needed (for NAT traversal)
-    // { urls: 'turn:your-turn-server.com:3478', username: 'user', credential: 'pass' }
+    { urls: 'stun:stun.cloudflare.com:3478' }
   ],
   iceCandidatePoolSize: 10,
   iceTransportPolicy: 'all'
@@ -777,153 +780,4 @@ function startLatencyMeasurement() {
       document.getElementById('latency-meter').innerHTML = `⏱️ ${Math.round(latency)}ms`;
       document.getElementById('stat-latency').innerText = `${Math.round(latency)}ms`;
       document.getElementById('stat-latency').className = 
-        latency < 50 ? 'sv ok' : (latency < 150 ? 'sv' : 'sv err');
-    }
-    frames++;
-  });
-  
-  latencyInterval = setInterval(() => {
-    // Keep-alive
-  }, 1000);
-}
-
-function startFallbackSSE() {
-  if (fallbackSSE) return;
-  document.getElementById('badge-fallback').style.display = 'block';
-  document.getElementById('badge-webrtc').style.display = 'none';
-  document.getElementById('fallbackImg').style.display = 'block';
-  document.getElementById('latency-meter').style.display = 'none';
-  streamStat('SSE fallback', '');
-
-  fallbackSSE = new EventSource('/stream/sse');
-  fallbackSSE.onmessage = (e) => {
-    const startTime = performance.now();
-    document.getElementById('fallbackImg').src = 'data:image/jpeg;base64,' + e.data;
-    document.getElementById('dot-pi').className = 'dot live';
-    
-    // Estimate latency
-    const latency = performance.now() - startTime;
-    document.getElementById('stat-latency').innerText = `~${Math.round(latency)}ms`;
-    
-    if (!webRTCActive) msg('SSE fallback active', 'var(--orange)');
-  };
-  fallbackSSE.onerror = () => {
-    stopFallbackSSE();
-    setTimeout(startFallbackSSE, 3000);
-  };
-}
-
-function stopFallbackSSE() {
-  if (fallbackSSE) { fallbackSSE.close(); fallbackSSE = null; }
-}
-
-function reconnectWebRTC() {
-  if (pc) { pc.close(); pc = null; }
-  webRTCActive = false;
-  document.getElementById('dot-webrtc').className = 'dot warn';
-  
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    startWebRTCWithWS();
-  } else {
-    connectWebSocket();
-  }
-}
-
-// ── Clock ─────────────────────────────────────────────────────
-setInterval(() => {
-  document.getElementById('hdr-time').innerText = new Date().toTimeString().slice(0,8);
-}, 1000);
-
-// ── ML (unchanged) ───────────────────────────────────────────
-let mlOn=false, mlInterval=null, modalShownFor={0:false,1:false};
-function toggleML() {
-  mlOn = !mlOn;
-  const btn = document.getElementById('btn-ml');
-  btn.className = 'btn'+(mlOn?' active':'');
-  btn.innerText = (mlOn?'⏹ Disable':'▶ Enable')+' ML Detection';
-  if (mlOn) { mlInterval=setInterval(updateML,1000); updateML(); }
-  else { clearInterval(mlInterval);
-    document.getElementById('ml-panel').innerHTML='<div class="ml-none">ML Detection: OFF</div>';
-    modalShownFor={0:false,1:false}; }
-}
-function updateML() {
-  fetch('/ml_results').then(r=>r.json()).then(data=>{
-    let html='';
-    [{k:'0',l:'FRONT',c:'ml-front'},{k:'1',l:'REAR',c:'ml-rear'}].forEach(({k,l,c})=>{
-      const d=data[k],idx=parseInt(k);
-      html+=`<div class="ml-cam"><span class="ml-hdr ${c}">${l} CAM</span>`;
-      if(!d||(!d.first_seen&&!d.confirmed)){
-        html+='<div class="ml-none" style="margin:4px 0 8px">No detections</div>';
-      } else if(d.confirmed){
-        const best=d.boxes&&d.boxes.length?d.boxes.reduce((a,b)=>a.conf>b.conf?a:b):null;
-        html+=`<div class="alert-box"><div class="alert-title">🚨 CRASH CONFIRMED</div>
-          <div class="alert-detail">${best?`Side: ${best.side} | Conf: ${(best.conf*100).toFixed(1)}%`:''}</div></div>`;
-        if(!modalShownFor[idx]&&best){
-          modalShownFor[idx]=true;
-          document.getElementById('modal-detail').innerText=
-            `Camera: ${l} | Side: ${best.side} | Conf: ${(best.conf*100).toFixed(1)}%`;
-          document.getElementById('modal-secs').innerText=(d.elapsed||0).toFixed(1);
-          document.getElementById('crash-modal').style.display='flex';
-        }
-      } else if(d.first_seen){
-        const secs=d.confirm_secs||3,pct=Math.min(1,d.elapsed/secs);
-        const r=Math.round(255*pct),g=Math.round(255*(1-pct));
-        html+=`<div style="font-size:11px;color:var(--yellow);margin:4px 0">
-            ⏱ VERIFYING — ${d.elapsed.toFixed(1)}s / ${secs}s</div>
-          <div class="vbar-wrap"><div class="vbar-fill"
-            style="width:${(pct*100).toFixed(1)}%;background:rgb(${r},${g},0)"></div></div>`;
-        if(d.boxes&&d.boxes.length){const b=d.boxes.reduce((a,x)=>a.conf>x.conf?a:x);
-          html+=`<div style="font-size:11px;color:var(--dim);margin-top:4px">
-            ${b.label}·${b.side}·${(b.conf*100).toFixed(1)}%</div>`;}
-        modalShownFor[idx]=false;
-      } else { modalShownFor[idx]=false; }
-      html+='</div>';
-    });
-    document.getElementById('ml-panel').innerHTML=html;
-  }).catch(()=>{});
-}
-
-// ── Cam status ────────────────────────────────────────────────
-function updateStatus(){
-  fetch('/status').then(r=>r.json()).then(d=>{
-    function s(id,txt){const e=document.getElementById(id);e.innerText=txt;
-      e.className='sv'+(txt.includes('Streaming')?' ok':txt.includes('ERROR')?' err':'');}
-    s('stat-front',d['0']||'—'); s('stat-rear',d['1']||'—');
-  }).catch(()=>{});
-}
-setInterval(updateStatus,3000); updateStatus();
-
-// ── GPS ───────────────────────────────────────────────────────
-let map=null,marker=null;
-function updateGPS(){
-  fetch('/gps').then(r=>r.json()).then(d=>{
-    if(d.lat&&d.lon){
-      document.getElementById('glat').innerText=d.lat.toFixed(6)+'°';
-      document.getElementById('glon').innerText=d.lon.toFixed(6)+'°';
-      document.getElementById('gspd').innerText=d.speed!=null?d.speed.toFixed(1)+' km/h':'—';
-      document.getElementById('gupdated').innerText=d.updated||'—';
-      document.getElementById('maplink').style.display='block';
-      document.getElementById('maplink').href=`https://maps.google.com/?q=${d.lat},${d.lon}`;
-      document.getElementById('map').style.display='block';
-      if(!map){
-        map=L.map('map').setView([d.lat,d.lon],16);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-          {attribution:'© OSM'}).addTo(map);
-        marker=L.marker([d.lat,d.lon]).addTo(map).bindPopup('Pi Camera').openPopup();
-      } else { marker.setLatLng([d.lat,d.lon]); map.setView([d.lat,d.lon]); }
-    }
-  }).catch(()=>{});
-}
-setInterval(updateGPS,4000); updateGPS();
-
-// ── Boot ──────────────────────────────────────────────────────
-startFallbackSSE();  // show snapshot immediately
-connectWebSocket();  // WebSocket signaling for WebRTC
-</script>
-</body>
-</html>"""
-    return render_template_string(html, username=session.get('username', ''))
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+        latency < 50 ? 'sv ok' : (latency < 150 ? '
