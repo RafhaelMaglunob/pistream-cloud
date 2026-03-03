@@ -66,7 +66,7 @@ detection_mode  = 'center'
 detected_colors = {0: [], 1: []}
 detection_lock  = threading.Lock()
 
-ml_detection_enabled = False
+ml_detection_enabled = True
 ml_lock    = threading.Lock()
 # Raw per-frame detections (unconfirmed)
 ml_results = {0: [], 1: []}
