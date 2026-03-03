@@ -400,7 +400,7 @@ def camera_thread(cam_idx):
 def overlay_worker():
     last={0:None,1:None}; skip={0:0,1:0}
     while True:
-        time.sleep(0.066)
+        time.sleep(0.033)
         for idx in (0,1):
             cam=cameras[idx]
             with cam["frame_lock"]: frame=cam["latest_frame"]
@@ -426,7 +426,7 @@ def overlay_worker():
 def ml_worker():
     last={0:None,1:None}
     while True:
-        time.sleep(0.08)
+        time.sleep(0.033)
         if not ml_detection_enabled:
             # Reset confirmation when ML is toggled off
             with confirm_lock:
@@ -459,7 +459,7 @@ def cloud_sender():
                     if r.status_code==200: last_sent=frame; lf=now
                     elif r.status_code==401: print("[CLOUD] ❌ Wrong secret")
                 except Exception as e: print(f"[CLOUD] Frame: {e}")
-        if now-lm>=2.0:
+        if now-lm>=0.5:
             with confirm_lock:
                 payload={str(idx):{
                     "confirmed": confirm_state[idx]["confirmed"],
@@ -925,7 +925,7 @@ function toggleML(){
       '<div class="ml-none">ML Detection: OFF — enable to begin monitoring</div>';
     modalShownFor={0:false,1:false};
   } else {
-    mlInterval=setInterval(updateML,800);
+    mlInterval=setInterval(updateML,300);
   }
 }
 function setMode(m){
