@@ -7,4 +7,12 @@ services:
     envVars:
       - key: PUSH_SECRET
         value: Rafhael@1
+      - key: ADMIN_PASSWORD
+        value: Rafhael@1
+      - key: VIEWER_PASSWORD
+        value: Rafhael@1
+      - key: SECRET_KEY
+        value: srv-d6e3a995pdvs73fo728g
+
+
     plan: free
