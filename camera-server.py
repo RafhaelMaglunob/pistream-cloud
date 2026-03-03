@@ -426,7 +426,7 @@ def overlay_worker():
 def ml_worker():
     last={0:None,1:None}
     while True:
-        time.sleep(0.5)
+        time.sleep(0.08)
         if not ml_detection_enabled:
             # Reset confirmation when ML is toggled off
             with confirm_lock:

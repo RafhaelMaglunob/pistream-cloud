@@ -35,8 +35,8 @@ except ImportError as e:
     print(f"[CLOUD] Missing dependency: {e}")
     print("[CLOUD] Run: pip install aiortc aiohttp websockets av")
 
-CLOUD_WS_URL = "wss://pistream-cloud.onrender.com/ws/pi"
-CLOUD_URL    = "https://pistream-cloud.onrender.com"
+CLOUD_WS_URL = "wss://YOUR-APP.up.railway.app/ws/pi"
+CLOUD_URL    = "https://YOUR-APP.up.railway.app"
 PUSH_SECRET  = "Rafhael@1"
 
 
