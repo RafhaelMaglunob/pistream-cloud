@@ -3,16 +3,14 @@ services:
     name: pistream-cloud
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn relay_server:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn relay_server:app --workers 1 --threads 8 --worker-class gthread --timeout 120 --bind 0.0.0.0:$PORT
     envVars:
       - key: PUSH_SECRET
-        value: Rafhael@1
+        value: Rafhael@1652
       - key: ADMIN_PASSWORD
-        value: Rafhael@1
+        value: Rafhael@1652
       - key: VIEWER_PASSWORD
-        value: Rafhael@1
+        value: Rafhael@1652
       - key: SECRET_KEY
-        value: Rafhael@1
-
-
+        value: Rafhael@1652
     plan: free
