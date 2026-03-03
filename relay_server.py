@@ -27,6 +27,10 @@ status_lock = threading.Lock()
 gps_lock    = threading.Lock()
 frame_event = threading.Event()
 
+# SSE: list of queues, one per connected browser client
+sse_clients     = []
+sse_clients_lock = threading.Lock()
+
 PUSH_SECRET = os.environ.get("PUSH_SECRET", "changeme123")
 
 # ── Auth decorator ────────────────────────────────────────────
@@ -105,6 +109,18 @@ def push_frame():
     with frame_lock:
         latest_frame = data
     frame_event.set()
+    # Fan out to all waiting SSE clients immediately
+    import base64
+    b64 = base64.b64encode(data).decode('ascii')
+    with sse_clients_lock:
+        dead = []
+        for q in sse_clients:
+            try:
+                q.put_nowait(b64)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            sse_clients.remove(q)
     return 'OK', 200
 
 @app.route('/push/ml', methods=['POST'])
@@ -162,9 +178,48 @@ def snapshot():
     return Response(frame, mimetype='image/jpeg',
                     headers={'Cache-Control': 'no-cache, no-store'})
 
-@app.route('/ml_results')
+@app.route('/stream/sse')
 @login_required
-def get_ml():
+def stream_sse():
+    """
+    Server-Sent Events endpoint.
+    Browser connects once; server pushes a new frame the instant
+    the Pi delivers it — no polling delay.
+    """
+    import queue as _queue
+    q = _queue.Queue(maxsize=4)
+    with sse_clients_lock:
+        sse_clients.append(q)
+
+    def generate():
+        try:
+            # Send the latest frame immediately so the page isn't blank
+            with frame_lock:
+                current = latest_frame
+            if current:
+                import base64
+                yield f"data:{base64.b64encode(current).decode('ascii')}\n\n"
+            while True:
+                try:
+                    b64 = q.get(timeout=30)   # 30s keepalive
+                    yield f"data:{b64}\n\n"
+                except Exception:
+                    yield ": keepalive\n\n"   # SSE comment keeps connection alive
+        except GeneratorExit:
+            pass
+        finally:
+            with sse_clients_lock:
+                try: sse_clients.remove(q)
+                except ValueError: pass
+
+    return Response(generate(),
+                    mimetype='text/event-stream',
+                    headers={
+                        'Cache-Control': 'no-cache',
+                        'X-Accel-Buffering': 'no',   # disables Nginx buffering on Render
+                    })
+
+
     with ml_lock:
         return jsonify(ml_results)
 
@@ -373,7 +428,7 @@ def index():
 
 <script>
 /* ── STATE ── */
-let mlOn = false, mlInterval = null, failCount = 0;
+let mlOn = false, mlInterval = null;
 let map = null, marker = null;
 let modalShownFor = {0: false, 1: false};
 
@@ -382,26 +437,35 @@ setInterval(() => {
   document.getElementById('hdr-time').innerText = new Date().toTimeString().slice(0,8);
 }, 1000);
 
-/* ── SNAPSHOT POLLING ~1fps ── */
+/* ── LIVE STREAM via Server-Sent Events ── */
 const img = document.getElementById('snapshot');
-setInterval(() => {
-  const tmp = new Image();
-  tmp.onload = () => {
-    img.src = tmp.src;
-    failCount = 0;
+let sseFailCount = 0;
+
+function connectSSE() {
+  const es = new EventSource('/stream/sse');
+
+  es.onmessage = (e) => {
+    // Frame arrives as base64 JPEG — set directly, zero poll delay
+    img.src = 'data:image/jpeg;base64,' + e.data;
+    sseFailCount = 0;
     document.getElementById('piconn').className = 'online';
-    document.getElementById('piconn').innerText = '⬤ Pi: Connected';
+    document.getElementById('piconn').innerText = '⬤ Pi: Connected (live)';
     document.getElementById('dot-pi').className = 'dot live';
   };
-  tmp.onerror = () => {
-    if (++failCount > 4) {
+
+  es.onerror = () => {
+    sseFailCount++;
+    document.getElementById('dot-pi').className = 'dot warn';
+    if (sseFailCount > 2) {
       document.getElementById('piconn').className = 'offline';
-      document.getElementById('piconn').innerText = '⬤ Pi: Disconnected — waiting for frame push';
-      document.getElementById('dot-pi').className = 'dot warn';
+      document.getElementById('piconn').innerText = '⬤ Pi: Disconnected — reconnecting...';
     }
+    es.close();
+    // Reconnect after 3s
+    setTimeout(connectSSE, 3000);
   };
-  tmp.src = '/snapshot.jpg?t=' + Date.now();
-}, 1100);
+}
+connectSSE();
 
 /* ── ML TOGGLE ── */
 function toggleML() {
