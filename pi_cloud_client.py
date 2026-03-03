@@ -22,7 +22,7 @@ import io
 CLOUD_WS_URL = "wss://pistream-cloud.onrender.com/ws/pi"
 PUSH_SECRET = "Rafhael@1"
 PI_ID = "raspberrypi"
-CLOUD_URL = "https://pistream-cloud.onrender.com"  # Add this for HTTP fallback
+CLOUD_URL = "https://pistream-cloud.onrender.com"
 
 # WebRTC globals
 peer_connection = None
@@ -31,8 +31,7 @@ ws_connected = False
 webrtc_active = False
 signaling_queue = queue.Queue(maxsize=20)
 
-# We'll need to access these from camera-server.py
-# For now, we'll create placeholders - the actual values will come from camera-server
+# These will be set by camera-server.py
 cameras = None
 combined_frame = None
 confirm_state = None
@@ -62,13 +61,13 @@ async def websocket_client():
     """Main WebSocket connection to relay server"""
     global web_socket, ws_connected, webrtc_active
     
-    uri = f"{CLOUD_WS_URL}?pi_id={PI_ID}"
-    headers = {"X-Secret": PUSH_SECRET}
+    # Method 1: Pass secret in URL query string (works with all websockets versions)
+    uri = f"{CLOUD_WS_URL}?pi_id={PI_ID}&secret={PUSH_SECRET}"
     
     while True:
         try:
             print(f"[CLOUD] Connecting to {uri}...")
-            async with websockets.connect(uri, extra_headers=headers) as ws:
+            async with websockets.connect(uri) as ws:
                 web_socket = ws
                 ws_connected = True
                 print("[CLOUD] ✅ WebSocket connected")
@@ -129,27 +128,31 @@ async def create_peer_connection():
                 return await self.recv()
             
             # Try overlay frame first (with detection boxes), fallback to raw
-            with cameras[self.cam_idx]["overlay_lock"]:
-                frame_bytes = cameras[self.cam_idx]["overlay_frame"]
-            if frame_bytes is None:
-                with cameras[self.cam_idx]["frame_lock"]:
-                    frame_bytes = cameras[self.cam_idx]["latest_frame"]
-            
-            if frame_bytes is None or frame_bytes is self.last_frame:
-                # No new frame, wait
+            try:
+                with cameras[self.cam_idx]["overlay_lock"]:
+                    frame_bytes = cameras[self.cam_idx]["overlay_frame"]
+                if frame_bytes is None:
+                    with cameras[self.cam_idx]["frame_lock"]:
+                        frame_bytes = cameras[self.cam_idx]["latest_frame"]
+                
+                if frame_bytes is None or frame_bytes is self.last_frame:
+                    await asyncio.sleep(0.033)
+                    return await self.recv()
+                
+                self.last_frame = frame_bytes
+                
+                # Convert JPEG bytes to VideoFrame
+                img = Image.open(io.BytesIO(frame_bytes))
+                frame = av.VideoFrame.from_ndarray(
+                    np.array(img), format="rgb24"
+                )
+                frame.pts = pts
+                frame.time_base = time_base
+                return frame
+            except Exception as e:
+                print(f"[CLOUD] Error in video track: {e}")
                 await asyncio.sleep(0.033)
                 return await self.recv()
-            
-            self.last_frame = frame_bytes
-            
-            # Convert JPEG bytes to VideoFrame
-            img = Image.open(io.BytesIO(frame_bytes))
-            frame = av.VideoFrame.from_ndarray(
-                np.array(img), format="rgb24"
-            )
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
     
     peer_connection = RTCPeerConnection()
     
@@ -162,14 +165,17 @@ async def create_peer_connection():
     @peer_connection.on("icecandidate")
     async def on_icecandidate(candidate):
         if candidate and web_socket and ws_connected:
-            await web_socket.send(json.dumps({
-                'type': 'ice',
-                'candidate': {
-                    'candidate': candidate.candidate,
-                    'sdpMid': candidate.sdpMid,
-                    'sdpMLineIndex': candidate.sdpMLineIndex
-                }
-            }))
+            try:
+                await web_socket.send(json.dumps({
+                    'type': 'ice',
+                    'candidate': {
+                        'candidate': candidate.candidate,
+                        'sdpMid': candidate.sdpMid,
+                        'sdpMLineIndex': candidate.sdpMLineIndex
+                    }
+                }))
+            except Exception as e:
+                print(f"[CLOUD] Error sending ICE candidate: {e}")
     
     @peer_connection.on("connectionstatechange")
     async def on_connectionstatechange():
@@ -189,29 +195,35 @@ async def send_offer():
         print("[CLOUD] No peer connection")
         return
     
-    offer = await peer_connection.createOffer()
-    await peer_connection.setLocalDescription(offer)
-    
-    if web_socket and ws_connected:
-        await web_socket.send(json.dumps({
-            'type': 'offer',
-            'sdp': {
-                'type': peer_connection.localDescription.type,
-                'sdp': peer_connection.localDescription.sdp
-            }
-        }))
-        print("[CLOUD] 📤 Sent SDP offer")
+    try:
+        offer = await peer_connection.createOffer()
+        await peer_connection.setLocalDescription(offer)
+        
+        if web_socket and ws_connected:
+            await web_socket.send(json.dumps({
+                'type': 'offer',
+                'sdp': {
+                    'type': peer_connection.localDescription.type,
+                    'sdp': peer_connection.localDescription.sdp
+                }
+            }))
+            print("[CLOUD] 📤 Sent SDP offer")
+    except Exception as e:
+        print(f"[CLOUD] Error sending offer: {e}")
 
 async def handle_answer(answer_sdp):
     """Handle SDP answer from viewer"""
     global peer_connection
     
-    answer = RTCSessionDescription(
-        type=answer_sdp['type'],
-        sdp=answer_sdp['sdp']
-    )
-    await peer_connection.setRemoteDescription(answer)
-    print("[CLOUD] 📥 Received SDP answer")
+    try:
+        answer = RTCSessionDescription(
+            type=answer_sdp['type'],
+            sdp=answer_sdp['sdp']
+        )
+        await peer_connection.setRemoteDescription(answer)
+        print("[CLOUD] 📥 Received SDP answer")
+    except Exception as e:
+        print(f"[CLOUD] Error handling answer: {e}")
 
 # ─────────────────── ENHANCED CLOUD SENDER ───────────────────
 def enhanced_cloud_sender():
@@ -225,15 +237,17 @@ def enhanced_cloud_sender():
     
     lf = ls = lg = lm = 0
     last_frame = None
+    error_count = 0
     
     print(f"[CLOUD] Enhanced sender started → {CLOUD_URL}")
+    print(f"[CLOUD] Using secret: {PUSH_SECRET[:3]}***{PUSH_SECRET[-3:]}")
     
     while True:
         now = time.time()
         
         # Push frame every 1s (fallback for SSE)
-        if now - lf >= 1.0 and combined_frame is not None:
-            if combined_frame and combined_frame is not last_frame:
+        if now - lf >= 1.0:
+            if combined_frame is not None and combined_frame is not last_frame:
                 try:
                     r = session.post(
                         f"{CLOUD_URL}/push/frame",
@@ -244,11 +258,20 @@ def enhanced_cloud_sender():
                     if r.status_code == 200:
                         last_frame = combined_frame
                         lf = now
-                        print(f"[CLOUD] Frame pushed, size: {len(combined_frame)} bytes")
+                        error_count = 0
+                        print(f"[CLOUD] ✅ Frame pushed, size: {len(combined_frame)} bytes")
                     elif r.status_code == 401:
-                        print("[CLOUD] ❌ Wrong secret")
+                        print("[CLOUD] ❌ Wrong secret - check PUSH_SECRET")
+                        error_count += 1
+                    else:
+                        print(f"[CLOUD] ⚠️ Unexpected status: {r.status_code}")
+                        error_count += 1
+                except requests.exceptions.ConnectionError:
+                    print(f"[CLOUD] ❌ Cannot connect to {CLOUD_URL}")
+                    error_count += 1
                 except Exception as e:
-                    print(f"[CLOUD] Frame push error: {e}")
+                    print(f"[CLOUD] ❌ Frame push error: {e}")
+                    error_count += 1
         
         # Push ML results every 2s
         if now - lm >= 2.0 and confirm_state is not None:
@@ -262,8 +285,9 @@ def enhanced_cloud_sender():
                         "confirm_secs": CRASH_CONFIRM_SECONDS
                     } for idx in (0, 1)
                 }
-                session.post(f"{CLOUD_URL}/push/ml", json=payload, timeout=5)
-                lm = now
+                r = session.post(f"{CLOUD_URL}/push/ml", json=payload, timeout=5)
+                if r.status_code == 200:
+                    lm = now
             except Exception as e:
                 print(f"[CLOUD] ML push error: {e}")
         
@@ -271,22 +295,24 @@ def enhanced_cloud_sender():
         if now - ls >= 10.0 and cameras is not None:
             try:
                 status = {
-                    "0": cameras[0]["status"],
-                    "1": cameras[1]["status"],
+                    "0": cameras[0]["status"] if cameras[0] else "Unknown",
+                    "1": cameras[1]["status"] if cameras[1] else "Unknown",
                     "webrtc": "Active" if webrtc_active else "Inactive",
                     "websocket": "Connected" if ws_connected else "Disconnected"
                 }
-                session.post(f"{CLOUD_URL}/push/status", json=status, timeout=5)
-                ls = now
+                r = session.post(f"{CLOUD_URL}/push/status", json=status, timeout=5)
+                if r.status_code == 200:
+                    ls = now
             except Exception as e:
                 print(f"[CLOUD] Status push error: {e}")
         
         # Push GPS every 10s
         if now - lg >= 10.0 and gps_state is not None:
             try:
-                if gps_state['lat'] and gps_state['lon']:
-                    session.post(f"{CLOUD_URL}/push/gps", json=gps_state, timeout=5)
-                    lg = now
+                if gps_state.get('lat') and gps_state.get('lon'):
+                    r = session.post(f"{CLOUD_URL}/push/gps", json=gps_state, timeout=5)
+                    if r.status_code == 200:
+                        lg = now
             except Exception as e:
                 print(f"[CLOUD] GPS push error: {e}")
         
