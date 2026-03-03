@@ -783,7 +783,7 @@ function startLatencyMeasurement() {
 document.getElementById('stat-latency').className = 
   latency < 50 ? 'sv ok' : (latency < 150 ? '
 
-// With this complete code:
+// Keep only this working code:
 document.getElementById('stat-latency').innerText = `${Math.round(latency)}ms`;
 document.getElementById('stat-latency').className = 
   latency < 50 ? 'sv ok' : (latency < 150 ? 'sv' : 'sv err');
