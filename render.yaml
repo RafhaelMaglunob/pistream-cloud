@@ -12,7 +12,7 @@ services:
       - key: VIEWER_PASSWORD
         value: Rafhael@1
       - key: SECRET_KEY
-        value: srv-d6e3a995pdvs73fo728g
+        value: Rafhael@1
 
 
     plan: free

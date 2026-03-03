@@ -449,41 +449,106 @@ def ml_worker():
             detect_accidents_in_frame(idx,frame)
 
 # ─────────────────── CLOUD SENDER ───────────────────
+# ─────────────────── CLOUD SENDER ───────────────────
 def cloud_sender():
-    if not CLOUD_ENABLED: return
-    session=req_lib.Session()
-    session.headers.update({"X-Secret":PUSH_SECRET})
-    lf=ls=lg=lm=0; last_sent=None
-    print(f"[CLOUD] Sender started → {CLOUD_URL}")
+    if not CLOUD_ENABLED: 
+        print("[CLOUD] ❌ Cloud disabled")
+        return
+    
+    print(f"[CLOUD] 🔵 Starting cloud sender...")
+    session = req_lib.Session()
+    session.headers.update({"X-Secret": PUSH_SECRET})
+    lf = ls = lg = lm = 0
+    last_sent = None
+    error_count = 0
+    
+    print(f"[CLOUD] 🔵 Sender started → {CLOUD_URL}")
+    print(f"[CLOUD] 🔑 Using secret: {PUSH_SECRET[:3]}***{PUSH_SECRET[-3:]}")
+    
     while True:
-        now=time.time()
-        if now-lf>=1.0:
-            with combined_frame_lock: frame=combined_frame
-            if frame and frame is not last_sent:
-                try:
-                    r=session.post(f"{CLOUD_URL}/push/frame",data=frame,
-                                   headers={"Content-Type":"image/jpeg"},timeout=8)
-                    if r.status_code==200: last_sent=frame; lf=now
-                    elif r.status_code==401: print("[CLOUD] ❌ Wrong secret")
-                except Exception as e: print(f"[CLOUD] Frame: {e}")
-        if now-lm>=2.0:
+        now = time.time()
+        
+        # Push frame every 1 second
+        if now - lf >= 1.0:
+            with combined_frame_lock: 
+                frame = combined_frame
+            
+            if frame:
+                if frame is not last_sent:
+                    try:
+                        print(f"[CLOUD] 📤 Sending frame ({len(frame)} bytes)...")
+                        r = session.post(
+                            f"{CLOUD_URL}/push/frame",
+                            data=frame,
+                            headers={"Content-Type": "image/jpeg"},
+                            timeout=8
+                        )
+                        print(f"[CLOUD] Response: {r.status_code}")
+                        
+                        if r.status_code == 200:
+                            last_sent = frame
+                            lf = now
+                            error_count = 0
+                            print(f"[CLOUD] ✅ Frame accepted")
+                        elif r.status_code == 401:
+                            print(f"[CLOUD] ❌ Authentication failed - Wrong PUSH_SECRET")
+                            error_count += 1
+                        else:
+                            print(f"[CLOUD] ⚠️ Unexpected status: {r.status_code}")
+                            error_count += 1
+                            
+                    except req_lib.exceptions.ConnectionError:
+                        print(f"[CLOUD] ❌ Cannot connect to {CLOUD_URL}")
+                        error_count += 1
+                    except Exception as e:
+                        print(f"[CLOUD] ❌ Error: {e}")
+                        error_count += 1
+            else:
+                if int(now) % 10 == 0:  # Print every 10 seconds
+                    print(f"[CLOUD] ⏳ No frame available yet")
+        
+        # Push ML results every 2 seconds
+        if now - lm >= 2.0:
             with confirm_lock:
-                payload={str(idx):{
+                payload = {str(idx): {
                     "confirmed": confirm_state[idx]["confirmed"],
-                    "elapsed":   round(confirm_state[idx]["elapsed"],1),
-                    "boxes":     confirm_state[idx]["boxes"]
-                } for idx in (0,1)}
-            try: session.post(f"{CLOUD_URL}/push/ml",json=payload,timeout=5); lm=now
-            except Exception: pass
-        if now-ls>=10.0:
-            s={str(idx):cameras[idx]["status"] for idx in (0,1)}
-            try: session.post(f"{CLOUD_URL}/push/status",json=s,timeout=5); ls=now
-            except Exception: pass
-        if now-lg>=10.0:
-            with gps_state_lock: gps=gps_state.copy()
+                    "elapsed": round(confirm_state[idx]["elapsed"], 1),
+                    "boxes": confirm_state[idx]["boxes"]
+                } for idx in (0, 1)}
+            try:
+                r = session.post(f"{CLOUD_URL}/push/ml", json=payload, timeout=5)
+                if r.status_code == 200:
+                    lm = now
+                elif r.status_code == 401:
+                    print(f"[CLOUD] ❌ ML push auth failed")
+            except Exception as e:
+                print(f"[CLOUD] ML push error: {e}")
+        
+        # Push status every 10 seconds
+        if now - ls >= 10.0:
+            s = {str(idx): cameras[idx]["status"] for idx in (0, 1)}
+            try:
+                r = session.post(f"{CLOUD_URL}/push/status", json=s, timeout=5)
+                if r.status_code == 200:
+                    ls = now
+                    print(f"[CLOUD] 📊 Status pushed: {s}")
+                elif r.status_code == 401:
+                    print(f"[CLOUD] ❌ Status push auth failed")
+            except Exception as e:
+                print(f"[CLOUD] Status push error: {e}")
+        
+        # Push GPS every 10 seconds
+        if now - lg >= 10.0:
+            with gps_state_lock: 
+                gps = gps_state.copy()
             if gps['lat'] and gps['lon']:
-                try: session.post(f"{CLOUD_URL}/push/gps",json=gps,timeout=5); lg=now
-                except Exception: pass
+                try:
+                    r = session.post(f"{CLOUD_URL}/push/gps", json=gps, timeout=5)
+                    if r.status_code == 200:
+                        lg = now
+                except Exception as e:
+                    print(f"[CLOUD] GPS push error: {e}")
+        
         time.sleep(0.5)
 
 # ─────────────────── GPS WORKER ─────────────────────
@@ -536,6 +601,7 @@ def generate_combined():
             time.sleep(0.033); continue
         stall=0; last=frame
         yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame+b'\r\n'
+
 
 def start_webrtc_signaling():
     """Start WebSocket server for WebRTC signaling"""
