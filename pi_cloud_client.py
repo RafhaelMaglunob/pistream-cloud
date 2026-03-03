@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pi Cloud Client — WebSocket signaling for WebRTC + Cloud push
-Add this to your existing camera-server.py to enable WebRTC streaming
+Run this alongside your camera-server.py
 """
 
 import asyncio
@@ -12,12 +12,17 @@ import time
 import requests
 import base64
 import queue
-from functools import partial
+import numpy as np
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCIceCandidate
+import av
+from PIL import Image
+import io
 
 # ─────────────────── CLOUD WEBSOCKET CONFIG ───────────────────
 CLOUD_WS_URL = "wss://pistream-cloud.onrender.com/ws/pi"
 PUSH_SECRET = "Rafhael@1"
 PI_ID = "raspberrypi"
+CLOUD_URL = "https://pistream-cloud.onrender.com"  # Add this for HTTP fallback
 
 # WebRTC globals
 peer_connection = None
@@ -26,10 +31,24 @@ ws_connected = False
 webrtc_active = False
 signaling_queue = queue.Queue(maxsize=20)
 
-# Reference to your existing cameras dict (imported from main)
-# You'll need to make cameras accessible, e.g., by importing from your main module
-# For now, we'll assume we can access it globally
+# We'll need to access these from camera-server.py
+# For now, we'll create placeholders - the actual values will come from camera-server
+cameras = None
+combined_frame = None
+confirm_state = None
+gps_state = None
+CRASH_CONFIRM_SECONDS = 3
 
+def set_globals(cameras_ref, combined_frame_ref, confirm_state_ref, gps_state_ref, confirm_secs):
+    """Call this from camera-server.py to pass the global variables"""
+    global cameras, combined_frame, confirm_state, gps_state, CRASH_CONFIRM_SECONDS
+    cameras = cameras_ref
+    combined_frame = combined_frame_ref
+    confirm_state = confirm_state_ref
+    gps_state = gps_state_ref
+    CRASH_CONFIRM_SECONDS = confirm_secs
+    print("[CLOUD] Globals set from camera-server.py")
+    
 def start_cloud_webrtc_client():
     """Start the WebSocket client in a background thread"""
     def run_async_loop():
@@ -72,7 +91,6 @@ async def websocket_client():
                     elif data['type'] == 'ice':
                         print("[CLOUD] Received ICE candidate")
                         if peer_connection:
-                            from aiortc import RTCIceCandidate
                             cand = data['candidate']
                             candidate = RTCIceCandidate(
                                 candidate=cand['candidate'],
@@ -96,9 +114,6 @@ async def create_peer_connection():
     """Create RTCPeerConnection with video tracks from your cameras"""
     global peer_connection, webrtc_active
     
-    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-    import av
-    
     class PiVideoStreamTrack(VideoStreamTrack):
         """Video track that pulls frames from your existing camera threads"""
         def __init__(self, cam_idx):
@@ -109,8 +124,9 @@ async def create_peer_connection():
         async def recv(self):
             pts, time_base = await self.next_timestamp()
             
-            # Get the latest frame from your camera's overlay_frame or latest_frame
-            from main import cameras  # Import your cameras dict
+            if cameras is None:
+                await asyncio.sleep(0.033)
+                return await self.recv()
             
             # Try overlay frame first (with detection boxes), fallback to raw
             with cameras[self.cam_idx]["overlay_lock"]:
@@ -120,15 +136,13 @@ async def create_peer_connection():
                     frame_bytes = cameras[self.cam_idx]["latest_frame"]
             
             if frame_bytes is None or frame_bytes is self.last_frame:
-                # No new frame, return a blank frame or wait
+                # No new frame, wait
                 await asyncio.sleep(0.033)
                 return await self.recv()
             
             self.last_frame = frame_bytes
             
             # Convert JPEG bytes to VideoFrame
-            import io
-            from PIL import Image
             img = Image.open(io.BytesIO(frame_bytes))
             frame = av.VideoFrame.from_ndarray(
                 np.array(img), format="rgb24"
@@ -192,7 +206,6 @@ async def handle_answer(answer_sdp):
     """Handle SDP answer from viewer"""
     global peer_connection
     
-    from aiortc import RTCSessionDescription
     answer = RTCSessionDescription(
         type=answer_sdp['type'],
         sdp=answer_sdp['sdp']
@@ -201,14 +214,11 @@ async def handle_answer(answer_sdp):
     print("[CLOUD] 📥 Received SDP answer")
 
 # ─────────────────── ENHANCED CLOUD SENDER ───────────────────
-# Replace your existing cloud_sender() with this enhanced version
-
 def enhanced_cloud_sender():
     """
     Enhanced cloud sender that also reports WebRTC status
-    Replace your existing cloud_sender() with this
     """
-    global webrtc_active, ws_connected
+    global webrtc_active, ws_connected, combined_frame, cameras, gps_state, confirm_state
     
     session = requests.Session()
     session.headers.update({"X-Secret": PUSH_SECRET})
@@ -222,8 +232,7 @@ def enhanced_cloud_sender():
         now = time.time()
         
         # Push frame every 1s (fallback for SSE)
-        if now - lf >= 1.0:
-            from main import combined_frame  # Import your combined frame
+        if now - lf >= 1.0 and combined_frame is not None:
             if combined_frame and combined_frame is not last_frame:
                 try:
                     r = session.post(
@@ -235,13 +244,15 @@ def enhanced_cloud_sender():
                     if r.status_code == 200:
                         last_frame = combined_frame
                         lf = now
+                        print(f"[CLOUD] Frame pushed, size: {len(combined_frame)} bytes")
+                    elif r.status_code == 401:
+                        print("[CLOUD] ❌ Wrong secret")
                 except Exception as e:
                     print(f"[CLOUD] Frame push error: {e}")
         
         # Push ML results every 2s
-        if now - lm >= 2.0:
+        if now - lm >= 2.0 and confirm_state is not None:
             try:
-                from main import confirm_state, CRASH_CONFIRM_SECONDS
                 payload = {
                     str(idx): {
                         "confirmed": confirm_state[idx]["confirmed"],
@@ -253,13 +264,12 @@ def enhanced_cloud_sender():
                 }
                 session.post(f"{CLOUD_URL}/push/ml", json=payload, timeout=5)
                 lm = now
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[CLOUD] ML push error: {e}")
         
         # Push status every 10s (including WebRTC status)
-        if now - ls >= 10.0:
+        if now - ls >= 10.0 and cameras is not None:
             try:
-                from main import cameras
                 status = {
                     "0": cameras[0]["status"],
                     "1": cameras[1]["status"],
@@ -268,47 +278,24 @@ def enhanced_cloud_sender():
                 }
                 session.post(f"{CLOUD_URL}/push/status", json=status, timeout=5)
                 ls = now
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[CLOUD] Status push error: {e}")
         
         # Push GPS every 10s
-        if now - lg >= 10.0:
+        if now - lg >= 10.0 and gps_state is not None:
             try:
-                from main import gps_state
                 if gps_state['lat'] and gps_state['lon']:
                     session.post(f"{CLOUD_URL}/push/gps", json=gps_state, timeout=5)
                     lg = now
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[CLOUD] GPS push error: {e}")
         
         time.sleep(0.5)
 
-# ─────────────────── INTEGRATION WITH YOUR MAIN ───────────────────
-"""
-To integrate this with your existing camera-server.py:
-
-1. Add imports at the top of your file:
-   import asyncio
-   import websockets
-   from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-   import av
-   import numpy as np
-
-2. Add these lines near the end of your main() function, before app.run():
-   # Start WebRTC client
-   start_cloud_webrtc_client()
-   
-   # Replace your existing cloud_sender thread with enhanced version
-   # Comment out your old cloud_sender thread and add:
-   threading.Thread(target=enhanced_cloud_sender, daemon=True).start()
-
-3. Install required packages on Pi:
-   pip install aiortc av websockets numpy Pillow
-"""
-
-# If you want to run this standalone for testing
 if __name__ == "__main__":
     print("Starting Pi Cloud WebRTC Client...")
+    print("NOTE: This should be run alongside camera-server.py")
+    print("The globals will be set by camera-server.py when it calls set_globals()")
     start_cloud_webrtc_client()
     
     # Keep the main thread alive

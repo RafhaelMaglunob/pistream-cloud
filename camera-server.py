@@ -20,6 +20,7 @@ import asyncio
 import websockets
 import threading
 import json
+import pi_cloud_client
 
 webrtc_active = False
 ws_server = None
@@ -648,7 +649,6 @@ def start_webrtc_signaling():
     
     threading.Thread(target=run_server, daemon=True).start()
 
-# Add this line in your main() function after other threads:
 start_webrtc_signaling()
 
 # ─────────────────── ROUTES ─────────────────────────
@@ -1231,16 +1231,37 @@ if __name__ == "__main__":
     local_ip = get_local_ip()
     kill_existing_cameras()
 
+    # Start camera threads first
     for idx in (0, 1):
         threading.Thread(target=camera_thread, args=(idx,), daemon=True).start()
 
     threading.Thread(target=overlay_worker, daemon=True).start()
     threading.Thread(target=ml_worker,      daemon=True).start()
-    threading.Thread(target=cloud_sender,   daemon=True).start()
     threading.Thread(target=gps_worker,     daemon=True).start()
 
+    # Wait for cameras to start
     cameras[0]["frame_ready"].wait(timeout=15)
     cameras[1]["frame_ready"].wait(timeout=5)
+
+    # NOW set up cloud client (after cameras are ready)
+    print("[MAIN] Setting up cloud client...")
+    pi_cloud_client.set_globals(
+        cameras, 
+        combined_frame, 
+        confirm_state, 
+        gps_state, 
+        CRASH_CONFIRM_SECONDS
+    )
+    
+    # Start WebRTC client
+    pi_cloud_client.start_cloud_webrtc_client()
+    
+    # Start enhanced cloud sender (comment out the old one)
+    # threading.Thread(target=cloud_sender, daemon=True).start()  # Comment this out
+    threading.Thread(target=pi_cloud_client.enhanced_cloud_sender, daemon=True).start()
+    
+    # Start local WebRTC signaling (optional)
+    start_webrtc_signaling()
 
     import logging
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
