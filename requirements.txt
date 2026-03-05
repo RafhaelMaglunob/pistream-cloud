@@ -1,3 +1,13 @@
+# ── Web framework ─────────────────────────────────────────────
 flask==3.0.3
 flask-sock==0.7.0
 gunicorn==22.0.0
+
+# ── Firebase ──────────────────────────────────────────────────
+firebase-admin==6.5.0
+
+# ── Email (stdlib — no install needed, listed for clarity) ────
+# smtplib, email — built into Python
+
+# ── Utilities (stdlib — no install needed) ───────────────────
+# threading, time, logging, os, json, queue, base64 — built into Python
