@@ -21,8 +21,8 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # ── Users ─────────────────────────────────────────────────────
 USERS = {
-    "admin":  os.environ.get("ADMIN_PASSWORD",  "admin123"),
-    "viewer": os.environ.get("VIEWER_PASSWORD", "viewer123"),
+    "admin@gmail.com":  os.environ.get("ADMIN_PASSWORD",  "Admin@2351"),
+    "rafhaelmaglunob02@gmail.com": os.environ.get("VIEWER_PASSWORD", "Rafhael@1"),
 }
 PUSH_SECRET = os.environ.get("PUSH_SECRET", "changeme123")
 
