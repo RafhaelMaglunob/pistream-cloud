@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Pi Camera Relay Server with Firebase Integration
-Deploy on Railway — WebSocket signaling + Firebase TrustedContact alerts
-10-second countdown before sending crash email to trusted contacts
+Email-only authentication (no password needed)
+Only allows: rafhaelmaglunob02@gmail.com
 """
 from flask import Flask, Response, jsonify, request, render_template_string, session, redirect, url_for
 from flask_sock import Sock
@@ -20,9 +20,11 @@ sock = Sock(app)
 app.secret_key = os.environ.get("SECRET_KEY", "supersecretkey123")
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
+# ── ALLOWED EMAIL (ONLY THIS CAN LOGIN) ────────────
+ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "rafhaelmaglunob02@gmail.com")
+
 # ── Firebase Init ─────────────────────────────────
 try:
-    # Initialize Firebase (use your Firebase credentials JSON)
     firebase_admin.initialize_app(credentials.Certificate("firebase-key.json"))
     db = firestore.client()
     FIREBASE_ENABLED = True
@@ -37,8 +39,8 @@ GMAIL_USER     = os.environ.get("GMAIL_USER",     "")
 GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
 
 # ── Crash notification with countdown ─────────────
-CRASH_DISMISS_TIMEOUT = 10  # seconds user has to dismiss
-CRASH_COOLDOWN = 60         # cooldown after confirmed send
+CRASH_DISMISS_TIMEOUT = 10
+CRASH_COOLDOWN = 60
 
 _crash_state = {0: {"detected": False, "timer": None, "time_left": 0}, 
                 1: {"detected": False, "timer": None, "time_left": 0}}
@@ -69,7 +71,7 @@ gps_lock    = threading.Lock()
 sse_clients      = []
 sse_clients_lock = threading.Lock()
 
-# ── Current logged-in user (for Firebase lookup) ──
+# ── Current logged-in user ──
 current_user_email = None
 user_lock = threading.Lock()
 
@@ -79,7 +81,6 @@ user_lock = threading.Lock()
 def get_trusted_contacts(user_email):
     """Fetch trusted contacts for user from Firebase"""
     if not FIREBASE_ENABLED or not db:
-        print("[FIREBASE] DB not available")
         return []
     
     try:
@@ -99,7 +100,7 @@ def get_trusted_contacts(user_email):
 def send_crash_email(cam_label, side, conf, elapsed, snapshot_bytes, user_email):
     """Send crash alert email to trusted contacts"""
     if not GMAIL_USER or not GMAIL_PASSWORD:
-        print("[EMAIL] Not configured — set GMAIL_USER, GMAIL_PASSWORD")
+        print("[EMAIL] Not configured")
         return
     
     contacts = get_trusted_contacts(user_email)
@@ -161,10 +162,7 @@ def send_crash_email(cam_label, side, conf, elapsed, snapshot_bytes, user_email)
   {location_btn}
   {"<p style='color:#aaa;font-size:12px;margin-top:8px'>📸 Snapshot attached.</p>" if snapshot_bytes else ""}
   <hr style="border:1px solid #222;margin:20px 0">
-  <p style="color:#444;font-size:11px;margin:0">
-    Pi Camera Crash Detection System<br>
-    From: {user_email}
-  </p>
+  <p style="color:#444;font-size:11px;margin:0">Pi Camera Crash Detection System</p>
 </div></body></html>"""
 
         subject = f"🚨 CRASH — {cam_label} | {side} | {conf:.0f}%"
@@ -179,8 +177,7 @@ def send_crash_email(cam_label, side, conf, elapsed, snapshot_bytes, user_email)
                 msg.attach(MIMEText(html_body, 'html'))
                 if snapshot_bytes:
                     img = MIMEImage(snapshot_bytes, _subtype='jpeg')
-                    img.add_header('Content-Disposition', 'attachment',
-                                   filename='crash_snapshot.jpg')
+                    img.add_header('Content-Disposition', 'attachment', filename='crash_snapshot.jpg')
                     msg.attach(img)
                 with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15) as smtp:
                     smtp.login(GMAIL_USER, GMAIL_PASSWORD)
@@ -193,17 +190,13 @@ def send_crash_email(cam_label, side, conf, elapsed, snapshot_bytes, user_email)
 
 
 def handle_crash_detection(cam_idx, ml_data):
-    """
-    Handle crash detection with 10-second countdown.
-    User can dismiss as false alarm within 10 seconds.
-    """
+    """Handle crash detection with 10-second countdown"""
     now = time.time()
     with _crash_lock:
         state = _crash_state[cam_idx]
         
         d = ml_data.get(str(cam_idx), {})
         if not d or not d.get('confirmed'):
-            # No detection — reset
             if state["timer"]:
                 state["timer"].cancel()
                 state["timer"] = None
@@ -211,9 +204,7 @@ def handle_crash_detection(cam_idx, ml_data):
             state["time_left"] = 0
             return
         
-        # Crash confirmed by Pi
         if not state["detected"]:
-            # NEW detection — start 10-second countdown
             state["detected"] = True
             state["time_left"] = CRASH_DISMISS_TIMEOUT
             
@@ -224,14 +215,12 @@ def handle_crash_detection(cam_idx, ml_data):
             conf = best['conf'] * 100 if best else 0.0
             elapsed = d.get('elapsed', 0.0)
             
-            print(f"[CRASH] 🚨 {label} crash detected! 10s countdown to alert...")
+            print(f"[CRASH] 🚨 {label} crash detected! 10s countdown...")
             _broadcast_viewers({"type": "crash_countdown", "cam": cam_idx, "seconds": CRASH_DISMISS_TIMEOUT})
             
-            # Schedule email send in 10 seconds if not dismissed
             def send_alert():
                 with _crash_lock:
                     if _crash_state[cam_idx]["detected"]:
-                        # Still detected → send email
                         with frame_lock: snap = latest_frame
                         with user_lock: user_email = current_user_email
                         if user_email:
@@ -258,7 +247,7 @@ def dismiss_crash(cam_idx):
 
 
 # ═════════════════════════════════════════════════════════════
-#  Auth
+#  Auth — Email Only (No Password)
 # ═════════════════════════════════════════════════════════════
 def login_required(f):
     @wraps(f)
@@ -278,39 +267,42 @@ def login():
     error = ''
     if request.method == 'POST':
         u = request.form.get('email', '').strip()
-        p = request.form.get('password', '')
         
-        # For demo: accept any email with password "User@123"
-        if p == os.environ.get("USER_PASSWORD", "User@123"):
+        # Only allow specific email (no password check)
+        if u.lower() == ALLOWED_EMAIL.lower():
             session['logged_in'] = True
             session['username']  = u
             with user_lock:
                 current_user_email = u
             return redirect(url_for('index'))
-        error = 'Invalid email or password'
+        error = f'Only {ALLOWED_EMAIL} is allowed to access'
     
     html = """<!DOCTYPE html><html><head><title>Login — Pi Camera</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>*{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#0f0;font-family:monospace;display:flex;
   align-items:center;justify-content:center;min-height:100vh}
-.box{border:2px solid #0f0;padding:40px;width:320px;text-align:center}
+.box{border:2px solid #0f0;padding:40px;width:340px;text-align:center}
 h1{font-size:20px;margin-bottom:24px}
+.subtitle{font-size:12px;color:#0f0;opacity:0.7;margin-bottom:20px}
 input{width:100%;background:#111;border:1px solid #0f0;color:#0f0;
   padding:10px;margin:8px 0;font-family:monospace;font-size:14px}
 button{width:100%;background:#0f0;color:#000;border:none;padding:12px;
   margin-top:16px;cursor:pointer;font-family:monospace;font-size:15px;font-weight:bold}
-.error{color:#f44;margin-top:12px;font-size:13px}
+button:hover{opacity:0.9}
+.error{color:#f44;margin-top:12px;font-size:13px;line-height:1.4}
+.note{color:#666;font-size:11px;margin-top:12px}
 </style></head><body>
 <div class="box">
   <div style="font-size:40px;margin-bottom:16px">🔒</div>
   <h1>Pi Camera Access</h1>
+  <div class="subtitle">Hardware Authentication</div>
   <form method="POST">
-    <input type="email" name="email" placeholder="Email" required autofocus>
-    <input type="password" name="password" placeholder="Password" required>
+    <input type="email" name="email" placeholder="Email Address" required autofocus>
     <button type="submit">LOGIN</button>
   </form>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if error %}<div class="error">❌ {{ error }}</div>{% endif %}
+  <div class="note">⚠ Only authorized email allowed<br>No password required</div>
 </div></body></html>"""
     return render_template_string(html, error=error)
 
@@ -513,7 +505,6 @@ def push_ml():
     data = request.get_json() or {}
     with ml_lock: ml_results = data
     
-    # Check both cameras for crash confirmation
     for cam_idx in (0, 1):
         handle_crash_detection(cam_idx, data)
     
@@ -588,7 +579,7 @@ def ping(): return 'pong', 200
 
 
 # ═════════════════════════════════════════════════════════════
-#  Main User Dashboard UI — Lite 360 Style
+#  Main User Dashboard UI
 # ═════════════════════════════════════════════════════════════
 @app.route('/')
 @login_required
@@ -638,7 +629,8 @@ body {
 .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .dot.warn { background: var(--orange); }
 .dot.err { background: var(--red); }
-a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red); padding: 3px 8px; }
+a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red); padding: 3px 8px; cursor: pointer; }
+a.logout:hover { background: rgba(255, 23, 68, 0.1); }
 
 .stream-container {
   display: flex; gap: 12px; padding: 14px 20px;
@@ -674,7 +666,6 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
   border: 1px solid var(--orange);
 }
 
-/* FULLSCREEN OVERLAY */
 #fullscreen-modal {
   display: none; position: fixed; inset: 0; z-index: 9998;
   background: #000; align-items: center; justify-content: center;
@@ -691,7 +682,6 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
   align-items: center; justify-content: center;
 }
 
-/* CRASH ALERT MODAL */
 #crash-modal {
   display: none; position: fixed; inset: 0; z-index: 9999;
   background: rgba(0, 0, 0, 0.85);
@@ -741,11 +731,7 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
   background: rgba(255, 23, 68, 0.2); border-color: var(--red);
   color: var(--red);
 }
-.crash-confirm:hover {
-  background: rgba(255, 23, 68, 0.4); box-shadow: 0 0 12px var(--red);
-}
 
-/* INFO PANEL */
 .info-grid {
   display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
   padding: 14px 20px;
@@ -770,16 +756,11 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
 .stat-val.ok { color: var(--green); }
 .stat-val.err { color: var(--red); }
 
-/* GPS */
 .gps-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .gps-val { font-size: 16px; font-weight: 700; color: var(--green); }
 .gps-key { font-size: 10px; color: var(--dim); letter-spacing: 1px; }
 #map { height: 200px; border: 1px solid var(--border); margin-top: 8px; }
-
-.logout { float: right; }
 </style>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
 
@@ -795,7 +776,6 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
   </div>
 </div>
 
-<!-- CAMERAS: 2-COLUMN LAYOUT -->
 <div class="stream-container">
   <div class="stream-panel">
     <img id="stream-front" src="/stream/front" alt="Front Camera">
@@ -809,13 +789,11 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
   </div>
 </div>
 
-<!-- FULLSCREEN MODAL -->
 <div id="fullscreen-modal">
   <img id="fullscreen-img" src="" alt="">
   <div class="fs-close" onclick="toggleFullscreen()">✕</div>
 </div>
 
-<!-- CRASH ALERT MODAL -->
 <div id="crash-modal">
   <div class="crash-box">
     <div class="crash-title">🚨 CRASH DETECTED</div>
@@ -835,9 +813,7 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
   </div>
 </div>
 
-<!-- INFO PANELS -->
 <div class="info-grid">
-  <!-- Status -->
   <div class="info-panel">
     <div class="panel-title">◉ Status</div>
     <div class="stat-row"><span class="stat-key">FRONT</span><span class="stat-val" id="s-f">—</span></div>
@@ -846,7 +822,6 @@ a.logout { color: var(--red); text-decoration: none; border: 1px solid var(--red
     <div class="stat-row"><span class="stat-key">SIGNAL</span><span class="stat-val" id="s-sig">—</span></div>
   </div>
 
-  <!-- GPS -->
   <div class="info-panel">
     <div class="panel-title">◎ GPS Location</div>
     <div class="gps-grid">
@@ -864,23 +839,19 @@ const ICE_CFG = {
     {urls: 'stun:stun.l.google.com:19302'},
     {urls: 'stun:stun1.l.google.com:19302'},
     {urls: 'stun:stun.cloudflare.com:3478'},
-    {urls: ['turn:openrelay.metered.ca:80',
-           'turn:openrelay.metered.ca:443',
+    {urls: ['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443',
            'turn:openrelay.metered.ca:443?transport=tcp'],
      username: 'openrelayproject', credential: 'openrelayproject'}
   ]
 };
 
-let ws = null, rtcLive = false, wsLive = false;
-let fsMode = null;
+let ws = null, rtcLive = false, wsLive = false, fsMode = null;
 let crashCountdown = 0, crashTimer = null, crashCam = null;
 
-// ── TIME ──
 setInterval(() => {
   document.getElementById('clock').textContent = new Date().toTimeString().slice(0, 8);
 }, 1000);
 
-// ── FULLSCREEN ──
 function toggleFullscreen(cam) {
   const modal = document.getElementById('fullscreen-modal');
   const img = document.getElementById('fullscreen-img');
@@ -894,7 +865,6 @@ function toggleFullscreen(cam) {
   }
 }
 
-// ── CRASH HANDLING ──
 function dismissCrash() {
   if (crashTimer) clearInterval(crashTimer);
   const modal = document.getElementById('crash-modal');
@@ -920,7 +890,6 @@ function showCrashAlert(cam, info) {
     
     if (crashCountdown <= 0) {
       clearInterval(crashTimer);
-      // Auto-close modal when timer expires
       setTimeout(() => {
         document.getElementById('crash-modal').classList.remove('active');
       }, 1000);
@@ -928,7 +897,6 @@ function showCrashAlert(cam, info) {
   }, 1000);
 }
 
-// ── WEBSOCKET ──
 function connectWS() {
   document.getElementById('dot-ws').classList = 'dot warn';
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -961,7 +929,6 @@ function connectWS() {
   };
 }
 
-// ── STATUS ──
 function updateStatus() {
   fetch('/status').then(r => r.json()).then(d => {
     document.getElementById('s-f').textContent = d['0'] || '—';
@@ -971,7 +938,6 @@ function updateStatus() {
 setInterval(updateStatus, 3000);
 updateStatus();
 
-// ── GPS ──
 let lmap = null, lmk = null;
 function updateGPS() {
   fetch('/gps').then(r => r.json()).then(d => {
@@ -994,7 +960,6 @@ function updateGPS() {
 setInterval(updateGPS, 5000);
 updateGPS();
 
-// ── INIT ──
 connectWS();
 </script>
 </body>
