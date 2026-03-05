@@ -6,6 +6,13 @@ Rear cam:  camera index 1
 
 CRASH CONFIRMATION: A detection must persist for CRASH_CONFIRM_SECONDS
 consecutive seconds before it is treated as a real alert (not a false alarm).
+
+QUALITY FIXES:
+- rpicam-vid --quality 90 (was 50)
+- PIL overlay save quality=92 (was 85)
+- PIL combined frame save quality=92 (was 82)
+- YOLO imgsz=640 (was 320)
+- CAM resolution 1280x720 (was 640x480)
 """
 
 from flask import Flask, Response, request, jsonify, render_template_string
@@ -22,7 +29,7 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # ─────────────────── CLOUD CONFIG ───────────────────
 CLOUD_URL     = "https://pistream-cloud.onrender.com"
-PUSH_SECRET   = "Rafhael@1"
+PUSH_SECRET   = "changeme123"
 CLOUD_ENABLED = True
 
 # ─────────────────── GPS CONFIG ─────────────────────
@@ -30,20 +37,20 @@ STATIC_LAT  = None
 STATIC_LON  = None
 GPS_PORT    = "/dev/ttyAMA0"
 GPS_BAUD    = 9600
-GPS_ENABLED = False   # ⭐ Set True only if you have a physical GPS module wired to GPIO
+GPS_ENABLED = False   # Set True only if you have a physical GPS module wired to GPIO
 
 # ─────────────────── CAMERA CONFIG ──────────────────
-CAM_WIDTH  = 640
-CAM_HEIGHT = 480
+CAM_WIDTH  = 1280   # ← was 640
+CAM_HEIGHT = 720    # ← was 480
 CAM_FPS    = 15
-COMBINED_W = 1280
-COMBINED_H = 480
+COMBINED_W = 2560   # ← was 1280  (2 × CAM_WIDTH)
+COMBINED_H = 720    # ← was 480
 
 # ─────────────────── CRASH CONFIRMATION CONFIG ───────
-CRASH_LABEL           = 'motor_crash'
-CRASH_CONF_THRESHOLD  = 0.90
-CRASH_CONFIRM_SECONDS = 3      # seconds of continuous detection → real alert
-CRASH_COOLDOWN_SECONDS = 10    # after confirmed, suppress re-alerts for this long
+CRASH_LABEL            = 'motor_crash'
+CRASH_CONF_THRESHOLD   = 0.90
+CRASH_CONFIRM_SECONDS  = 3      # seconds of continuous detection → real alert
+CRASH_COOLDOWN_SECONDS = 10     # after confirmed, suppress re-alerts for this long
 
 # ─────────────────── GLOBALS ────────────────────────
 cameras = {
@@ -68,20 +75,18 @@ detection_lock  = threading.Lock()
 
 ml_detection_enabled = True
 ml_lock    = threading.Lock()
-# Raw per-frame detections (unconfirmed)
 ml_results = {0: [], 1: []}
 
 # ── Confirmation state ─────────────────────────────
-# Per camera: tracks how long crash has been continuously seen
 confirm_lock  = threading.Lock()
 confirm_state = {
     0: {
-        "first_seen":    None,   # time() when detection started
-        "elapsed":       0.0,    # seconds detection has been held
-        "confirmed":     False,  # has it crossed CRASH_CONFIRM_SECONDS?
-        "confirmed_at":  None,   # time() it was confirmed
-        "cooldown_until":0.0,    # don't re-confirm until this time
-        "boxes":         [],     # boxes currently in window
+        "first_seen":    None,
+        "elapsed":       0.0,
+        "confirmed":     False,
+        "confirmed_at":  None,
+        "cooldown_until":0.0,
+        "boxes":         [],
     },
     1: {
         "first_seen":    None,
@@ -168,13 +173,9 @@ def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
 
 # ─────────────────── ML DETECTION + CONFIRMATION ────
 def detect_accidents_in_frame(cam_idx, frame_bytes):
-    """
-    Run inference, update raw ml_results, then advance the confirmation
-    state machine for this camera.
-    """
     try:
         img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
-        results = model.predict(source=np.array(img), imgsz=320, conf=0.5, verbose=False)
+        results = model.predict(source=np.array(img), imgsz=640, conf=0.5, verbose=False)  # ← was 320
         boxes = []
         w, h = img.size
         for r in results:
@@ -198,7 +199,6 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
             cs = confirm_state[cam_idx]
 
             if boxes:
-                # Still (or newly) detecting a crash
                 if cs["first_seen"] is None:
                     cs["first_seen"]   = now
                     cs["elapsed"]      = 0.0
@@ -208,16 +208,14 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
                 cs["boxes"]   = boxes
                 cs["elapsed"] = now - cs["first_seen"]
 
-                # Cross the threshold for the first time (and not in cooldown)?
                 if (not cs["confirmed"]
                         and cs["elapsed"] >= CRASH_CONFIRM_SECONDS
                         and now >= cs["cooldown_until"]):
-                    cs["confirmed"]    = True
-                    cs["confirmed_at"] = now
+                    cs["confirmed"]      = True
+                    cs["confirmed_at"]   = now
                     cs["cooldown_until"] = now + CRASH_COOLDOWN_SECONDS
                     print(f"[CAM{cam_idx}] ✅ CRASH CONFIRMED after {cs['elapsed']:.1f}s")
             else:
-                # No detection this frame → reset the accumulator
                 if cs["first_seen"] is not None:
                     held = now - cs["first_seen"]
                     if not cs["confirmed"]:
@@ -237,15 +235,15 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
         img  = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
         draw = ImageDraw.Draw(img, 'RGBA')
         try:
-            font  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
-            sfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 11)
+            font  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 18)
+            sfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
         except Exception:
             font  = ImageFont.load_default()
             sfont = font
 
         # Camera label badge
         badge_col = (0, 200, 255, 220) if cam_idx == 0 else (255, 100, 0, 220)
-        draw.rectangle([4, 4, 100, 24], fill=badge_col)
+        draw.rectangle([4, 4, 120, 28], fill=badge_col)
         draw.text((8, 6), cameras[cam_idx]["label"], fill=(0,0,0,255), font=font)
 
         with detection_lock:
@@ -261,7 +259,7 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
 
         # ── Draw boxes with confirmation-aware colour ───
         with confirm_lock:
-            cs        = confirm_state[cam_idx].copy()
+            cs = confirm_state[cam_idx].copy()
         with ml_lock:
             boxes = ml_results[cam_idx].copy()
 
@@ -271,36 +269,34 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
 
             if cs["confirmed"] and cs["confirmed_at"] and \
                now - cs["confirmed_at"] < CRASH_COOLDOWN_SECONDS:
-                # RED — confirmed crash
                 box_color  = (255, 0, 0, 255)
                 text_bg    = (200, 0, 0, 220)
                 status_tag = "CONFIRMED"
             elif cs["first_seen"] is not None and not cs["confirmed"]:
-                # YELLOW — accumulating, show progress bar text
                 pct  = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
                 fill = int(pct * 255)
                 box_color  = (255, fill, 0, 255)
                 text_bg    = (160, 100, 0, 200)
                 status_tag = f"VERIFYING {cs['elapsed']:.1f}/{CRASH_CONFIRM_SECONDS}s"
             else:
-                continue   # no active detection for this camera
+                continue
 
             draw.rectangle([x1,y1,x2,y2], outline=box_color, width=3)
             text = f"{b['label']} {b['conf']*100:.0f}% {b['side']} | {status_tag}"
-            tw   = len(text) * 7
-            draw.rectangle([x1, max(0,y1-18), x1+tw, y1], fill=text_bg)
-            draw.text((x1+2, max(0,y1-16)), text, fill=(255,255,255,255), font=sfont)
+            tw   = len(text) * 8
+            draw.rectangle([x1, max(0,y1-22), x1+tw, y1], fill=text_bg)
+            draw.text((x1+2, max(0,y1-20)), text, fill=(255,255,255,255), font=sfont)
 
-        # ── Confirmation progress arc (bottom of frame) ─
+        # ── Confirmation progress bar (bottom of frame) ─
         if cs["first_seen"] is not None and not cs["confirmed"]:
             pct  = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
             iw, ih = img.size
             bar_w = int(iw * pct)
-            draw.rectangle([0, ih-6, iw, ih], fill=(40,40,40,200))
-            draw.rectangle([0, ih-6, bar_w, ih], fill=(255, int(255*(1-pct)), 0, 220))
+            draw.rectangle([0, ih-8, iw, ih], fill=(40,40,40,200))
+            draw.rectangle([0, ih-8, bar_w, ih], fill=(255, int(255*(1-pct)), 0, 220))
 
         out = io.BytesIO()
-        img.save(out, format='JPEG', quality=85)
+        img.save(out, format='JPEG', quality=92)   # ← was 85
         return out.getvalue()
     except Exception as e:
         print(f"Overlay error cam{cam_idx}: {e}")
@@ -311,22 +307,22 @@ def combine_frames(front_bytes, rear_bytes):
     try:
         front = Image.open(io.BytesIO(front_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT))
         rear  = Image.open(io.BytesIO(rear_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT))
-        canvas = Image.new('RGB', (COMBINED_W, COMBINED_H + 28), (10, 10, 10))
-        canvas.paste(front, (0, 28))
-        canvas.paste(rear,  (CAM_WIDTH, 28))
+        canvas = Image.new('RGB', (COMBINED_W, COMBINED_H + 32), (10, 10, 10))
+        canvas.paste(front, (0, 32))
+        canvas.paste(rear,  (CAM_WIDTH, 32))
         draw = ImageDraw.Draw(canvas)
         try:
-            hfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
+            hfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 18)
         except Exception:
             hfont = ImageFont.load_default()
-        draw.rectangle([0, 0, COMBINED_W, 28], fill=(10, 10, 10))
-        draw.text((8, 6),            "◀ FRONT", fill=(0, 200, 255), font=hfont)
-        draw.text((CAM_WIDTH + 8, 6),"REAR ▶",  fill=(255, 120, 0), font=hfont)
-        draw.line([(CAM_WIDTH,0),(CAM_WIDTH,COMBINED_H+28)], fill=(40,40,40), width=2)
+        draw.rectangle([0, 0, COMBINED_W, 32], fill=(10, 10, 10))
+        draw.text((8, 8),            "◀ FRONT", fill=(0, 200, 255), font=hfont)
+        draw.text((CAM_WIDTH + 8, 8),"REAR ▶",  fill=(255, 120, 0), font=hfont)
+        draw.line([(CAM_WIDTH,0),(CAM_WIDTH,COMBINED_H+32)], fill=(40,40,40), width=2)
         ts = time.strftime("%Y-%m-%d  %H:%M:%S")
-        draw.text((COMBINED_W//2 - 80, 6), ts, fill=(180,180,180), font=hfont)
+        draw.text((COMBINED_W//2 - 90, 8), ts, fill=(180,180,180), font=hfont)
         out = io.BytesIO()
-        canvas.save(out, format='JPEG', quality=82)
+        canvas.save(out, format='JPEG', quality=92)   # ← was 82
         return out.getvalue()
     except Exception as e:
         print(f"Combine error: {e}"); return front_bytes
@@ -351,7 +347,8 @@ def camera_thread(cam_idx):
                  '--width',  str(CAM_WIDTH),
                  '--height', str(CAM_HEIGHT),
                  '--framerate', str(CAM_FPS),
-                 '--codec','mjpeg','--quality','50',
+                 '--codec','mjpeg',
+                 '--quality','90',        # ← was 50
                  '--inline','--nopreview','--denoise','off',
                  '--flush','1','-o','-'],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
@@ -368,7 +365,7 @@ def camera_thread(cam_idx):
                     set_cam_status(cam_idx,f"Process ended. {err or '(none)'}");
                     with cam["frame_lock"]: cam["latest_frame"]=None; break
                 buffer+=chunk
-                if len(buffer)>4*1024*1024: buffer=b''; continue
+                if len(buffer)>8*1024*1024: buffer=b''; continue  # ← raised buffer limit for larger frames
                 while True:
                     soi=buffer.find(SOI)
                     if soi==-1: break
@@ -428,7 +425,6 @@ def ml_worker():
     while True:
         time.sleep(0.033)
         if not ml_detection_enabled:
-            # Reset confirmation when ML is toggled off
             with confirm_lock:
                 for idx in (0,1):
                     confirm_state[idx].update({
@@ -450,6 +446,7 @@ def cloud_sender():
     print(f"[CLOUD] Sender started → {CLOUD_URL}")
     while True:
         now=time.time()
+        # Push combined frame every ~1s
         if now-lf>=1.0:
             with combined_frame_lock: frame=combined_frame
             if frame and frame is not last_sent:
@@ -459,6 +456,7 @@ def cloud_sender():
                     if r.status_code==200: last_sent=frame; lf=now
                     elif r.status_code==401: print("[CLOUD] ❌ Wrong secret")
                 except Exception as e: print(f"[CLOUD] Frame: {e}")
+        # Push ML results every 0.5s
         if now-lm>=0.5:
             with confirm_lock:
                 payload={str(idx):{
@@ -468,10 +466,12 @@ def cloud_sender():
                 } for idx in (0,1)}
             try: session.post(f"{CLOUD_URL}/push/ml",json=payload,timeout=5); lm=now
             except Exception: pass
+        # Push camera status every 10s
         if now-ls>=10.0:
             s={str(idx):cameras[idx]["status"] for idx in (0,1)}
             try: session.post(f"{CLOUD_URL}/push/status",json=s,timeout=5); ls=now
             except Exception: pass
+        # Push GPS every 10s
         if now-lg>=10.0:
             with gps_state_lock: gps=gps_state.copy()
             if gps['lat'] and gps['lon']:
@@ -583,7 +583,6 @@ def get_colors():
 
 @app.route('/ml_results')
 def get_ml_results():
-    """Returns both raw boxes AND confirmation state for the UI."""
     with confirm_lock:
         cs = {
             idx: {
@@ -608,6 +607,10 @@ def get_status():
 def get_gps():
     with gps_state_lock: return jsonify(gps_state)
 
+@app.route('/ping')
+def ping():
+    return 'pong', 200
+
 # ─────────────────── HTML UI ────────────────────────
 @app.route('/')
 def index():
@@ -631,7 +634,6 @@ def index():
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;min-height:100vh}
 
-/* HEADER */
 .header{display:flex;align-items:center;justify-content:space-between;
   padding:10px 20px;
   background:linear-gradient(135deg,#050a0e 60%,#0a1a28);
@@ -644,7 +646,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
   margin-right:4px;box-shadow:0 0 4px currentColor;transition:background .3s}
 .dot.live{background:var(--green)}.dot.warn{background:var(--orange)}
 
-/* VIEW BAR */
 .view-bar{display:flex;justify-content:center;gap:8px;padding:10px 20px;
   background:var(--panel);border-bottom:1px solid var(--border)}
 .vbtn{font-family:'Rajdhani',sans-serif;font-weight:600;font-size:13px;letter-spacing:1px;
@@ -653,22 +654,19 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 .vbtn:hover{border-color:var(--cyan);color:var(--cyan)}
 .vbtn.active{background:var(--cyan);color:#000;border-color:var(--cyan)}
 
-/* STREAM */
 .stream-wrapper{position:relative;background:#000;display:flex;justify-content:center;
   border-bottom:2px solid var(--border);overflow:hidden}
-.stream-combined{width:100%;max-width:1280px;display:block}
-.stream-single{width:100%;max-width:640px;display:block}
-.stream-split{display:flex;width:100%;max-width:1280px}
+.stream-combined{width:100%;max-width:2560px;display:block}
+.stream-single{width:100%;max-width:1280px;display:block}
+.stream-split{display:flex;width:100%;max-width:2560px}
 .stream-split img{width:50%;display:block}
-.split-divider{width:3px;background:linear-gradient(to bottom,var(--cyan),var(--orange));
-  flex-shrink:0;z-index:2}
+.split-divider{width:3px;background:linear-gradient(to bottom,var(--cyan),var(--orange));flex-shrink:0;z-index:2}
 .cam-label{position:absolute;top:8px;font-size:12px;font-family:'Rajdhani',sans-serif;
   font-weight:700;letter-spacing:2px;padding:3px 10px;pointer-events:none}
 .cam-label-front{left:10px;background:rgba(0,229,255,.2);color:var(--cyan);border:1px solid var(--cyan)}
 .cam-label-rear{right:10px;background:rgba(255,109,0,.2);color:var(--orange);border:1px solid var(--orange)}
 #reconnect-msg{text-align:center;color:var(--orange);font-size:12px;min-height:18px;padding:4px}
 
-/* GRID */
 .bottom-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:14px 20px}
 @media(max-width:900px){.bottom-grid{grid-template-columns:1fr 1fr}}
 @media(max-width:580px){.bottom-grid{grid-template-columns:1fr}}
@@ -677,7 +675,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
   letter-spacing:2px;color:var(--dim);margin-bottom:10px;text-transform:uppercase;
   border-bottom:1px solid var(--border);padding-bottom:6px}
 
-/* BUTTONS */
 .ctrl-row{display:flex;gap:8px;flex-wrap:wrap}
 .btn{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:13px;letter-spacing:1px;
   padding:8px 14px;border:1px solid var(--border);background:transparent;
@@ -688,22 +685,18 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 .btn.active-orange{background:rgba(255,109,0,.15);color:var(--orange);border-color:var(--orange);
   box-shadow:0 0 8px rgba(255,109,0,.3)}
 
-/* ML PANEL */
 .ml-cam-section{margin-bottom:10px}
 .ml-cam-header{font-size:11px;letter-spacing:2px;margin-bottom:6px;padding:3px 8px;display:inline-block}
 .ml-cam-front-h{background:rgba(0,229,255,.15);color:var(--cyan);border:1px solid var(--cyan)}
 .ml-cam-rear-h{background:rgba(255,109,0,.15);color:var(--orange);border:1px solid var(--orange)}
 
-/* CONFIRMATION BAR */
 .confirm-bar-wrap{background:#0d1e2e;border:1px solid var(--border);
   border-radius:2px;height:10px;margin:6px 0;overflow:hidden;position:relative}
 .confirm-bar-fill{height:100%;transition:width .4s linear;border-radius:2px}
 .confirm-bar-label{font-size:10px;color:var(--dim);margin-top:2px}
 
-/* CONFIRMED ALERT BOX */
 .alert-confirmed{
-  border:2px solid var(--red);
-  background:rgba(255,23,68,.1);
+  border:2px solid var(--red);background:rgba(255,23,68,.1);
   padding:8px 10px;margin-bottom:6px;
   animation:pulseAlert 1s infinite alternate;
 }
@@ -719,7 +712,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
   text-overflow:ellipsis;white-space:nowrap}
 .stat-val.ok{color:var(--green)}.stat-val.err{color:var(--red)}
 
-/* GPS */
 .gps-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .gps-val{font-size:18px;font-weight:bold;color:var(--green);font-family:'Rajdhani',sans-serif}
 .gps-key{font-size:10px;color:var(--dim);letter-spacing:1px}
@@ -727,10 +719,8 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 #maplink{font-size:11px;color:var(--cyan);margin-top:4px;display:none;text-decoration:none}
 #maplink:hover{text-decoration:underline}
 
-/* Color readings */
 #color-panel{font-size:11px}
 
-/* Rec dot */
 @keyframes recblink{0%,100%{opacity:1}50%{opacity:0}}
 .rec-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
   background:var(--red);animation:recblink 1.2s infinite;margin-right:4px}
@@ -758,7 +748,7 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 </div>
 
 <div class="stream-wrapper" id="stream-wrapper">
-  <div id="view-360" style="width:100%;max-width:1280px">
+  <div id="view-360" style="width:100%;max-width:2560px">
     <img class="stream-combined" id="stream-360" src="/stream">
     <span class="cam-label cam-label-front">◀ FRONT</span>
     <span class="cam-label cam-label-rear">REAR ▶</span>
@@ -775,7 +765,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 
 <div class="bottom-grid">
 
-  <!-- CONTROLS -->
   <div class="panel">
     <div class="panel-title"><span class="rec-dot"></span>Controls</div>
     <div class="ctrl-row" style="margin-bottom:8px">
@@ -789,11 +778,12 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
     </div>
     <div style="margin-top:12px;font-size:10px;color:var(--dim);border-top:1px solid var(--border);padding-top:8px">
       Confirm threshold: <span style="color:var(--yellow)" id="lbl-threshold">3s</span><br>
-      Cooldown after alert: <span style="color:var(--yellow)">10s</span>
+      Cooldown after alert: <span style="color:var(--yellow)">10s</span><br>
+      Resolution: <span style="color:var(--cyan)">1280×720 per cam</span><br>
+      Quality: <span style="color:var(--cyan)">JPEG 90/92</span>
     </div>
   </div>
 
-  <!-- ML / CRASH PANEL -->
   <div class="panel" style="grid-column:span 2">
     <div class="panel-title">⚠ Accident Detection</div>
     <div id="ml-panel">
@@ -801,7 +791,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
     </div>
   </div>
 
-  <!-- CAMERA STATUS -->
   <div class="panel">
     <div class="panel-title">◉ Camera Status</div>
     <div class="stat-row"><span class="stat-key">FRONT</span><span class="stat-val" id="stat-front">—</span></div>
@@ -810,7 +799,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
       <span class="stat-key">CLOUD</span><span class="stat-val" id="stat-cloud">—</span></div>
   </div>
 
-  <!-- GPS + MAP -->
   <div class="panel" style="grid-column:span 2">
     <div class="panel-title">◎ GPS Location</div>
     <div class="gps-grid">
@@ -823,7 +811,6 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
     <a id="maplink" href="#" target="_blank">📌 Open in Google Maps</a>
   </div>
 
-  <!-- COLOR READINGS -->
   <div class="panel">
     <div class="panel-title">◐ Color Readings</div>
     <div id="color-panel" style="color:var(--dim);font-size:11px">Color detection: OFF</div>
@@ -831,11 +818,8 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 
 </div>
 
-<!-- ═══════════════════════════════════════════════
-     CRASH ALERT MODAL
-════════════════════════════════════════════════ -->
 <div id="crash-modal" style="display:none;position:fixed;inset:0;z-index:9999;
-  background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center">
+  background:rgba(0,0,0,.75);align-items:center;justify-content:center">
   <div style="background:#0d0608;border:2px solid var(--red);max-width:460px;width:90%;
               padding:28px 30px;box-shadow:0 0 40px rgba(255,23,68,.5)">
     <div style="font-family:'Rajdhani',sans-serif;font-weight:700;font-size:26px;
@@ -845,7 +829,7 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
     <div style="font-size:13px;color:#ffb3b3;margin-bottom:18px" id="modal-detail">—</div>
     <div style="font-size:11px;color:var(--dim);margin-bottom:18px">
       Detection persisted for ≥ <span style="color:var(--yellow)" id="modal-secs">3</span>s
-      — classified as a <strong style="color:var(--red)">real event</strong>, not a false alarm.
+      — classified as a <strong style="color:var(--red)">real event</strong>.
     </div>
     <div style="display:flex;gap:10px">
       <button onclick="dismissModal(false)"
@@ -865,20 +849,17 @@ body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monosp
 </div>
 
 <script>
-/* ─── STATE ─── */
 let colorOn=false, mlOn=false, curMode='center';
 let mlInterval=null, curView='360', streamRetries={};
 let map=null, marker=null;
-let modalShownFor={0:false,1:false};   // track per-cam modal shown
+let modalShownFor={0:false,1:false};
 let confirmSecs=3;
 
-/* ─── TIME ─── */
 function updateTime(){
   document.getElementById('hdr-time').innerText=new Date().toTimeString().slice(0,8);
 }
 setInterval(updateTime,1000); updateTime();
 
-/* ─── VIEW ─── */
 function setView(v){
   curView=v;
   ['360','front','rear','split'].forEach(x=>{
@@ -888,7 +869,6 @@ function setView(v){
   });
 }
 
-/* ─── STREAM RECONNECT ─── */
 function watchStream(el,src){
   el.onerror=function(){
     let r=(streamRetries[src]||0)+1; streamRetries[src]=r;
@@ -905,7 +885,6 @@ function watchStream(el,src){
   if(el) watchStream(el, el.getAttribute('src').split('?')[0]);
 });
 
-/* ─── CONTROLS ─── */
 function toggleColor(){
   colorOn=!colorOn;
   fetch('/detection',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -936,14 +915,12 @@ function setMode(m){
   document.getElementById('btn-mode-g').className='btn'+(m==='grid'?' active-cyan':'');
 }
 
-/* ─── CRASH MODAL ─── */
 function showModal(camLabel, boxes, secs){
   const best=boxes.reduce((a,b)=>a.conf>b.conf?a:b, boxes[0]);
   document.getElementById('modal-detail').innerText=
-    `Camera: ${camLabel}  |  Side: ${best.side}  |  Confidence: ${(best.conf*100).toFixed(1)}%`;
+    'Camera: '+camLabel+' | Side: '+best.side+' | Confidence: '+(best.conf*100).toFixed(1)+'%';
   document.getElementById('modal-secs').innerText=secs.toFixed(1);
   document.getElementById('crash-modal').style.display='flex';
-  // play alert sound if supported
   try{ const a=new AudioContext(); const o=a.createOscillator();
     o.connect(a.destination); o.frequency.value=880;
     o.start(); setTimeout(()=>o.stop(),300); }catch(e){}
@@ -953,75 +930,53 @@ function dismissModal(report){
   if(report) console.log('Reported crash to operator');
 }
 
-/* ─── ML UPDATE ─── */
 function updateML(){
   fetch('/ml_results').then(r=>r.json()).then(data=>{
     confirmSecs = (data.front?.confirm_secs || data.rear?.confirm_secs || 3);
     document.getElementById('lbl-threshold').innerText = confirmSecs+'s';
-
     let html='';
-
     ['front','rear'].forEach(key=>{
-      const d    = data[key];
-      const idx  = key==='front'?0:1;
-      const label= key==='front'?'FRONT':'REAR';
-      const hdrCls= key==='front'?'ml-cam-front-h':'ml-cam-rear-h';
-
-      html+=`<div class="ml-cam-section">
-        <span class="ml-cam-header ${hdrCls}">${label} CAM</span>`;
-
-      if(!d || (!d.first_seen && !d.confirmed)){
+      const d=data[key], idx=key==='front'?0:1;
+      const label=key==='front'?'FRONT':'REAR';
+      const hdrCls=key==='front'?'ml-cam-front-h':'ml-cam-rear-h';
+      html+=`<div class="ml-cam-section"><span class="ml-cam-header ${hdrCls}">${label} CAM</span>`;
+      if(!d||(!d.first_seen&&!d.confirmed)){
         html+='<div class="ml-none" style="margin:4px 0 8px 0">No detections</div>';
       } else if(d.confirmed){
-        // ── CONFIRMED ──
-        html+=`<div class="alert-confirmed">
-          <div class="alert-title">🚨 CRASH CONFIRMED</div>
+        html+=`<div class="alert-confirmed"><div class="alert-title">🚨 CRASH CONFIRMED</div>
           <div class="alert-detail">`;
-        if(d.boxes && d.boxes.length){
+        if(d.boxes&&d.boxes.length){
           const best=d.boxes.reduce((a,b)=>a.conf>b.conf?a:b,d.boxes[0]);
           html+=`Side: ${best.side} &nbsp;|&nbsp; Conf: ${(best.conf*100).toFixed(1)}%`;
         }
         html+=`</div></div>`;
-        // Trigger modal if not shown yet for this camera
-        if(!modalShownFor[idx] && d.boxes && d.boxes.length){
+        if(!modalShownFor[idx]&&d.boxes&&d.boxes.length){
           modalShownFor[idx]=true;
-          showModal(label, d.boxes, d.elapsed);
+          showModal(label,d.boxes,d.elapsed);
         }
       } else if(d.first_seen){
-        // ── VERIFYING ──
-        const pct   = Math.min(1, d.elapsed / confirmSecs);
-        const pctPx = (pct*100).toFixed(1);
-        const r     = Math.round(255*pct);
-        const g     = Math.round(255*(1-pct));
-        const barCol= `rgb(${r},${g},0)`;
+        const pct=Math.min(1,d.elapsed/confirmSecs);
+        const pctPx=(pct*100).toFixed(1);
+        const r=Math.round(255*pct), g=Math.round(255*(1-pct));
         html+=`<div style="font-size:11px;color:var(--yellow);margin:4px 0">
           ⏱ VERIFYING — ${d.elapsed.toFixed(1)}s / ${confirmSecs}s</div>
           <div class="confirm-bar-wrap">
-            <div class="confirm-bar-fill"
-              style="width:${pctPx}%;background:${barCol}"></div>
+            <div class="confirm-bar-fill" style="width:${pctPx}%;background:rgb(${r},${g},0)"></div>
           </div>
-          <div class="confirm-bar-label">
-            Holding for ${confirmSecs}s to confirm real crash&hellip;
-          </div>`;
-        if(d.boxes && d.boxes.length){
+          <div class="confirm-bar-label">Holding for ${confirmSecs}s to confirm real crash…</div>`;
+        if(d.boxes&&d.boxes.length){
           const best=d.boxes.reduce((a,b)=>a.conf>b.conf?a:b,d.boxes[0]);
           html+=`<div style="font-size:11px;color:var(--dim);margin-top:4px">
             ${best.label} · ${best.side} · ${(best.conf*100).toFixed(1)}%</div>`;
         }
-        // Reset modal flag if detection dropped (so it shows again on re-confirm)
         modalShownFor[idx]=false;
-      } else {
-        modalShownFor[idx]=false;
-      }
-
+      } else { modalShownFor[idx]=false; }
       html+='</div>';
     });
-
     document.getElementById('ml-panel').innerHTML=html;
   }).catch(()=>{});
 }
 
-/* ─── STATUS ─── */
 function updateStatus(){
   fetch('/status').then(r=>r.json()).then(d=>{
     function el(id,txt){
@@ -1035,12 +990,11 @@ function updateStatus(){
       (d.front&&d.front.includes('Streaming')?' live':' warn');
     document.getElementById('dot-r').className='dot'+
       (d.rear&&d.rear.includes('Streaming')?' live':' warn');
-    document.getElementById('stat-cloud').innerText='ENABLED → cloud';
+    document.getElementById('stat-cloud').innerText='ENABLED → Render';
   }).catch(()=>{});
 }
 setInterval(updateStatus,2000); updateStatus();
 
-/* ─── GPS ─── */
 function updateGPS(){
   fetch('/gps').then(r=>r.json()).then(d=>{
     if(d.lat&&d.lon){
@@ -1064,7 +1018,6 @@ function updateGPS(){
 }
 setInterval(updateGPS,3000); updateGPS();
 
-/* ─── COLORS ─── */
 function updateColors(){
   fetch('/colors').then(r=>r.json()).then(d=>{
     const all=[...(d.front||[]).map(x=>({...x,cam:'FRONT'})),
@@ -1082,14 +1035,7 @@ function updateColors(){
       </div>`).join('');
   }).catch(()=>{});
 }
-// watch color toggle
-const origToggleColor=toggleColor;
-window.toggleColor=function(){
-  origToggleColor();
-  if(colorOn) setInterval(updateColors,800);
-};
 
-/* ─── INIT ─── */
 document.getElementById('btn-mode-c').className='btn active-cyan';
 </script>
 </body>
@@ -1130,9 +1076,10 @@ if __name__ == "__main__":
     print(f"  Combined:   http://{local_ip}:{selected_port}/stream")
     print(f"  Front:      http://{local_ip}:{selected_port}/stream/front")
     print(f"  Rear:       http://{local_ip}:{selected_port}/stream/rear")
+    print(f"  Resolution: {CAM_WIDTH}x{CAM_HEIGHT} per camera")
+    print(f"  Quality:    rpicam=90, PIL=92")
     print(f"  Confirm:    {CRASH_CONFIRM_SECONDS}s hold required")
     print(f"  Cooldown:   {CRASH_COOLDOWN_SECONDS}s after confirmed alert")
     print(f"{'='*55}\n")
 
     app.run(host='0.0.0.0', port=selected_port, threaded=True)
-
