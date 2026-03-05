@@ -17,7 +17,7 @@ app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # ─────────────────── CLOUD CONFIG ───────────────────
-CLOUD_URL     = "https://pistream-cloud.onrender.com/"  # Update to your Railway URL
+CLOUD_URL     = "https://pi"  # Update to your Railway URL
 PUSH_SECRET   = "Rafhael@1"  # Must match server SECRET_KEY
 CLOUD_ENABLED = True
 

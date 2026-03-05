@@ -24,11 +24,11 @@ USERS = {
     "admin@gmail.com":  os.environ.get("ADMIN_PASSWORD",  "Admin@2351"),
     "rafhaelmaglunob02@gmail.com": os.environ.get("VIEWER_PASSWORD", "Rafhael@1"),
 }
-PUSH_SECRET = os.environ.get("PUSH_SECRET", "changeme123")
+PUSH_SECRET = os.environ.get("PUSH_SECRET", "Rafhael@1")
 
 # ── Gmail config ──────────────────────────────────────────────
-GMAIL_USER     = os.environ.get("GMAIL_USER",     "")
-GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
+GMAIL_USER     = os.environ.get("GMAIL_USER",     "motosphere.smart@gmail.com")
+GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "evidjfvmdlpudgam")
 ALERT_EMAILS   = [e.strip() for e in os.environ.get("ALERT_EMAILS", "").split(",") if e.strip()]
 
 # ── Crash notification cooldown ───────────────────────────────
