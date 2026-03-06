@@ -29,7 +29,7 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # ─────────────────── CLOUD CONFIG ───────────────────
 CLOUD_URL     = "https://pistream-cloud.onrender.com"
-PUSH_SECRET   = "changeme123"
+PUSH_SECRET   = "Rafhael@1"
 CLOUD_ENABLED = True
 
 # ─────────────────── GPS CONFIG ─────────────────────
