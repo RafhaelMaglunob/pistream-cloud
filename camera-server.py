@@ -40,11 +40,11 @@ GPS_BAUD    = 9600
 GPS_ENABLED = False   # Set True only if you have a physical GPS module wired to GPIO
 
 # ─────────────────── CAMERA CONFIG ──────────────────
-CAM_WIDTH  = 1280   # ← was 640
-CAM_HEIGHT = 720    # ← was 480
+CAM_WIDTH  = 640   # ← was 640
+CAM_HEIGHT = 480    # ← was 480
 CAM_FPS    = 15
-COMBINED_W = 2560   # ← was 1280  (2 × CAM_WIDTH)
-COMBINED_H = 720    # ← was 480
+COMBINED_W = 1280  # ← was 1280  (2 × CAM_WIDTH)
+COMBINED_H = 480    # ← was 480
 
 # ─────────────────── CRASH CONFIRMATION CONFIG ───────
 CRASH_LABEL            = 'motor_crash'
