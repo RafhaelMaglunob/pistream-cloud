@@ -1,57 +1,93 @@
 #!/usr/bin/env python3
 """
-Pi Dual CSI Camera — Lite 360 Style
-Front cam: camera index 0
-Rear cam:  camera index 1
-
-CRASH CONFIRMATION: A detection must persist for CRASH_CONFIRM_SECONDS
-consecutive seconds before it is treated as a real alert (not a false alarm).
-
-SHARPNESS FIXES:
-- rpicam-vid --sharpness 2.0 --contrast 1.1 --awb auto
-- PIL LANCZOS resize (was default)
-- CSS max-width fixed to 1280px (was 2560px causing stretch blur)
-- Resolution 640x480 per cam, combined 1280x480
+Pi Dual CSI Camera — HD 360° + Crash Recording + Pi-side Email + Firebase Upload
+- 10s pre/post ring buffer recording
+- ffmpeg MP4 compilation
+- 10s cancel window (phone polls /crash_alert, calls /crash_cancel)
+- Pi sends email via Gmail SMTP using smtplib (no cloud, no phone)
+- Queues email if offline, retries every 15s until internet returns
+- Emergency contact fetched from Firebase Firestore per rider
+- Uploads crash video + snapshot to Firebase Storage after cancel window
+- Writes CrashEvents Firestore document (triggers serverless email tomorrow)
+- OWNER_EMAIL hardcoded — change with: nano app.py then restart
 """
 
 from flask import Flask, Response, request, jsonify, render_template_string
-import threading, time, socket, io, subprocess, queue
+import threading, time, socket, io, subprocess, hashlib
+import collections, os, glob, shutil
 import numpy as np
+import base64
 from PIL import Image, ImageDraw, ImageFont
 import colorsys
 import torch
 from ultralytics import YOLO
 import requests as req_lib
+from datetime import datetime
+from functools import wraps
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
-# ─────────────────── CLOUD CONFIG ───────────────────
-CLOUD_URL     = "https://pistream-cloud.onrender.com"
-PUSH_SECRET   = "Rafhael@1"
-CLOUD_ENABLED = True
+# RELAY SERVER
+RELAY_URL = "https://pistream-cloud.onrender.com"
+
+# ═════════════════════════════════════════════════════
+# OWNER CONFIG
+# ═════════════════════════════════════════════════════
+OWNER_EMAIL = "rafhaelmaglunob02@gmail.com"
+
+# ─────────────────── FIREBASE CONFIG ────────────────
+FIREBASE_PROJECT_ID  = "motospherebsit3b"
+FIREBASE_API_KEY     = "AIzaSyDllJ3djkebxHZxHlcp6w54goiDMsXiaS8"
+FIREBASE_STORAGE_BUCKET = "motospherebsit3b.firebasestorage.app"
+
+RIDERS_COLLECTION      = "Riders"
+CRASH_EVENTS_COLLECTION = "CrashEvents"
+
+# ─────────────────── SMTP CONFIG ────────────────────
+SMTP_HOST     = "smtp.gmail.com"
+SMTP_PORT     = 587
+SMTP_USER     = "motosphere.smart@gmail.com"
+SMTP_PASSWORD = "evidjfvmdlpudgam"
 
 # ─────────────────── GPS CONFIG ─────────────────────
-STATIC_LAT  = None
-STATIC_LON  = None
-GPS_PORT    = "/dev/ttyAMA0"
-GPS_BAUD    = 9600
-GPS_ENABLED = False
+STATIC_LAT = None
+STATIC_LON = None
+GPS_PORT   = "/dev/ttyAMA0"
+GPS_BAUD   = 9600
 
 # ─────────────────── CAMERA CONFIG ──────────────────
-CAM_WIDTH  = 640
-CAM_HEIGHT = 480
+CAM_WIDTH  = 600
+CAM_HEIGHT = 320
 CAM_FPS    = 15
-COMBINED_W = 1280   # 2 × CAM_WIDTH
+COMBINED_W = 1280
 COMBINED_H = 480
 
-# ─────────────────── CRASH CONFIRMATION CONFIG ───────
+# ─────────────────── CRASH CONFIG ───────────────────
 CRASH_LABEL            = 'motor_crash'
 CRASH_CONF_THRESHOLD   = 0.90
 CRASH_CONFIRM_SECONDS  = 3
 CRASH_COOLDOWN_SECONDS = 10
 
-# ─────────────────── GLOBALS ────────────────────────
+# ─────────────────── RECORDING CONFIG ───────────────
+RECORD_PRE_SECONDS  = 10
+RECORD_POST_SECONDS = 10
+RECORD_FPS          = 10
+RECORD_DIR          = "/tmp/piCam_crashes"
+RING_MAXLEN         = RECORD_PRE_SECONDS * RECORD_FPS
+
+os.makedirs(RECORD_DIR, exist_ok=True)
+
+# ─────────────────── DEVICE ID ──────────────────────
+import uuid as _uuid
+DEVICE_ID = hashlib.sha256(str(_uuid.getnode()).encode()).hexdigest()[:16]
+
+# ─────────────────── CAMERA GLOBALS ─────────────────
 cameras = {
     0: {"label": "FRONT", "latest_frame": None, "overlay_frame": None,
         "status": "Starting...", "frame_lock": threading.Lock(),
@@ -84,16 +120,30 @@ confirm_state = {
         "confirmed_at": None, "cooldown_until": 0.0, "boxes": []},
 }
 
-model      = None
-
+model          = None
 gps_state      = {"lat": None, "lon": None, "speed": None}
 gps_state_lock = threading.Lock()
 
-ml_queue     = queue.Queue(maxsize=5)
-status_queue = queue.Queue(maxsize=5)
-gps_queue    = queue.Queue(maxsize=5)
+ring_buffer      = collections.deque(maxlen=RING_MAXLEN)
+ring_buffer_lock = threading.Lock()
 
-# ─────────────────── UTILS ──────────────────────────
+crash_record_lock  = threading.Lock()
+crash_record_state = {
+    "active":       False,
+    "session_id":   None,
+    "cancel_event": None,
+    "confirmed_at": None,
+    "cam_idx":      None,
+    "seconds_left": 0.0,
+}
+
+_email_queue      = []
+_email_queue_lock = threading.Lock()
+
+# ═════════════════════════════════════════════════════
+# UTILS
+# ═════════════════════════════════════════════════════
+
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -101,13 +151,23 @@ def get_local_ip():
     except Exception: return "0.0.0.0"
 
 def check_port(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock   = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     result = sock.connect_ex(('127.0.0.1', port)); sock.close(); return result != 0
 
 def set_cam_status(cam_idx, msg):
     with cameras[cam_idx]["status_lock"]:
         cameras[cam_idx]["status"] = msg
     print(f"[CAM{cam_idx}] {msg}")
+
+def has_internet() -> bool:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(("8.8.8.8", 53))
+        s.close()
+        return True
+    except Exception:
+        return False
 
 def rgb_to_color_name(r, g, b):
     h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
@@ -118,8 +178,8 @@ def rgb_to_color_name(r, g, b):
         else: return "Gray"
     if v < 20: return "Black"
     if h < 15 or h >= 345: return "Red"
-    elif h < 45: return "Orange"
-    elif h < 75: return "Yellow"
+    elif h < 45:  return "Orange"
+    elif h < 75:  return "Yellow"
     elif h < 155: return "Green"
     elif h < 185: return "Cyan"
     elif h < 250: return "Blue"
@@ -127,7 +187,186 @@ def rgb_to_color_name(r, g, b):
     elif h < 345: return "Magenta"
     return "Unknown"
 
-# ─────────────────── COLOR DETECTION ────────────────
+# ═════════════════════════════════════════════════════
+# AUTH
+# ═════════════════════════════════════════════════════
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        return f(*args, **kwargs)
+    return decorated
+
+# ═════════════════════════════════════════════════════
+# FIREBASE — EMERGENCY CONTACT (TRUSTEDCONTACT)
+# ═════════════════════════════════════════════════════
+
+def get_emergency_contact(rider_email: str) -> str | None:
+    """
+    Fetch emergency contact from TrustedContact collection.
+    Query: contactEmail == rider_email AND status == 'accepted'
+    Return: email field (the trusted contact's email)
+    """
+    try:
+        url = (
+            f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}"
+            f"/databases/(default)/documents:runQuery"
+            f"?key={FIREBASE_API_KEY}"
+        )
+
+        body = {
+            "structuredQuery": {
+                "from": [{"collectionId": "TrustedContact"}],
+                "where": {
+                    "compositeFilter": {
+                        "op": "AND",
+                        "filters": [
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "contactEmail"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": rider_email}
+                                }
+                            },
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "status"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": "accepted"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+        r = req_lib.post(url, json=body, timeout=6)
+
+        if r.status_code == 200:
+            results = r.json()
+            for item in results:
+                if "document" in item:
+                    fields = item["document"].get("fields", {})
+                    contact_email = fields.get("email", {}).get("stringValue")
+                    if contact_email:
+                        print(f"[FIREBASE] Found TrustedContact for {rider_email}: {contact_email}")
+                        return contact_email
+            print(f"[FIREBASE] No accepted TrustedContact found for {rider_email}")
+        else:
+            print(f"[FIREBASE] Query failed ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        print(f"[FIREBASE] get_emergency_contact error: {e}")
+    return None
+
+# ═════════════════════════════════════════════════════
+# FIREBASE STORAGE — UPLOAD
+# ═════════════════════════════════════════════════════
+
+def _firebase_storage_upload(local_path: str, remote_path: str,
+                              content_type: str) -> str | None:
+    try:
+        import urllib.parse
+        encoded = urllib.parse.quote(remote_path, safe='')
+        url = (
+            f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
+            f"/o?uploadType=media&name={encoded}&key={FIREBASE_API_KEY}"
+        )
+        with open(local_path, 'rb') as f:
+            data = f.read()
+
+        r = req_lib.post(url, data=data,
+                         headers={"Content-Type": content_type},
+                         timeout=120)
+
+        if r.status_code in (200, 201):
+            token = r.json().get("downloadTokens", "")
+            download_url = (
+                f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
+                f"/o/{encoded}?alt=media&token={token}"
+            )
+            print(f"[STORAGE] ✅ Uploaded → {remote_path}")
+            return download_url
+        else:
+            print(f"[STORAGE] ❌ Upload failed ({r.status_code}): {r.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"[STORAGE] ❌ Upload error: {e}")
+        return None
+
+
+def upload_crash_to_firebase(session_id: str,
+                              snapshot_path: str | None,
+                              video_path: str | None) -> dict:
+    result = {"snapshot_url": None, "video_url": None}
+
+    if snapshot_path and os.path.exists(snapshot_path):
+        remote = f"crashes/{session_id}/snapshot.jpg"
+        result["snapshot_url"] = _firebase_storage_upload(
+            snapshot_path, remote, "image/jpeg")
+
+    if video_path and os.path.exists(video_path):
+        remote = f"crashes/{session_id}/crash_clip.mp4"
+        result["video_url"] = _firebase_storage_upload(
+            video_path, remote, "video/mp4")
+
+    return result
+
+# ═════════════════════════════════════════════════════
+# FIRESTORE — CRASH EVENT DOCUMENT
+# ═════════════════════════════════════════════════════
+
+def write_crash_event(session_id: str,
+                      rider_email: str,
+                      emergency_email: str | None,
+                      cam_label: str,
+                      location_str: str,
+                      speed_str: str,
+                      snapshot_url: str | None,
+                      video_url: str | None) -> bool:
+    try:
+        url = (
+            f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}"
+            f"/databases/(default)/documents/{CRASH_EVENTS_COLLECTION}/{session_id}"
+            f"?key={FIREBASE_API_KEY}"
+        )
+
+        def _str(v):  return {"stringValue": v or ""}
+        def _null():  return {"nullValue": None}
+
+        body = {
+            "fields": {
+                "session_id":      _str(session_id),
+                "device_id":       _str(DEVICE_ID),
+                "rider_email":     _str(rider_email),
+                "emergency_email": _str(emergency_email) if emergency_email else _null(),
+                "cam_label":       _str(cam_label),
+                "location":        _str(location_str),
+                "speed":           _str(speed_str),
+                "time":            _str(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                "snapshot_url":    _str(snapshot_url) if snapshot_url else _null(),
+                "video_url":       _str(video_url)    if video_url    else _null(),
+                "status":          _str("pending"),
+            }
+        }
+
+        r = req_lib.patch(url, json=body, timeout=10)
+
+        if r.status_code in (200, 201):
+            print(f"[FIRESTORE] ✅ CrashEvent written → {session_id}")
+            return True
+        else:
+            print(f"[FIRESTORE] ❌ Write failed ({r.status_code}): {r.text[:200]}")
+            return False
+
+    except Exception as e:
+        print(f"[FIRESTORE] ❌ Error: {e}")
+        return False
+
+# ═════════════════════════════════════════════════════
+# COLOR DETECTION
+# ═════════════════════════════════════════════════════
+
 def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
     try:
         img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
@@ -135,8 +374,8 @@ def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
         h, w = arr.shape[:2]
         colors = []
         if mode == 'center':
-            cx, cy = w//2, h//2
-            sample = arr[max(0,cy-30):cy+30, max(0,cx-30):cx+30]
+            cx, cy  = w//2, h//2
+            sample  = arr[max(0,cy-40):cy+40, max(0,cx-40):cx+40]
             r, g, b = sample.mean(axis=(0,1)).astype(int)
             colors.append({'position':'center','rgb':f'rgb({r},{g},{b})',
                 'rgba':f'rgba({r},{g},{b},1)','hex':f'#{r:02x}{g:02x}{b:02x}',
@@ -146,7 +385,7 @@ def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
             for i in range(3):
                 for j in range(3):
                     x=int(w*(j+0.5)/3); y=int(h*(i+0.5)/3)
-                    sample=arr[max(0,y-20):y+20,max(0,x-20):x+20]
+                    sample=arr[max(0,y-30):y+30,max(0,x-30):x+30]
                     r,g,b=sample.mean(axis=(0,1)).astype(int)
                     colors.append({'position':f'grid_{i}_{j}','rgb':f'rgb({r},{g},{b})',
                         'rgba':f'rgba({r},{g},{b},1)','hex':f'#{r:02x}{g:02x}{b:02x}',
@@ -157,13 +396,17 @@ def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
     except Exception as e:
         print(f"Color detection error cam{cam_idx}: {e}")
 
-# ─────────────────── ML DETECTION + CONFIRMATION ────
+# ═════════════════════════════════════════════════════
+# ML DETECTION + CRASH CONFIRMATION
+# ═════════════════════════════════════════════════════
+
 def detect_accidents_in_frame(cam_idx, frame_bytes):
     try:
-        img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
+        img     = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
         results = model.predict(source=np.array(img), imgsz=640, conf=0.5, verbose=False)
-        boxes = []
-        w, h = img.size
+        boxes   = []
+        w, h    = img.size
+
         for r in results:
             if len(r.boxes) == 0: continue
             for box, conf, cls in zip(r.boxes.xyxy, r.boxes.conf, r.boxes.cls):
@@ -171,7 +414,7 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
                 if label != CRASH_LABEL: continue
                 if float(conf) < CRASH_CONF_THRESHOLD: continue
                 x1,y1,x2,y2 = map(int, box.tolist())
-                cx = (x1+x2)//2
+                cx   = (x1+x2)//2
                 side = 'Left' if cx < w/3 else ('Center' if cx < w*2/3 else 'Right')
                 boxes.append({'box':[x1,y1,x2,y2],'label':label,
                               'conf':float(conf),'side':side,'cam':cam_idx})
@@ -184,12 +427,13 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
             cs = confirm_state[cam_idx]
             if boxes:
                 if cs["first_seen"] is None:
-                    cs["first_seen"]   = now
-                    cs["elapsed"]      = 0.0
-                    cs["confirmed"]    = False
+                    cs["first_seen"] = now
+                    cs["elapsed"]    = 0.0
+                    cs["confirmed"]  = False
                     cs["confirmed_at"] = None
                 cs["boxes"]   = boxes
                 cs["elapsed"] = now - cs["first_seen"]
+
                 if (not cs["confirmed"]
                         and cs["elapsed"] >= CRASH_CONFIRM_SECONDS
                         and now >= cs["cooldown_until"]):
@@ -197,33 +441,361 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
                     cs["confirmed_at"]   = now
                     cs["cooldown_until"] = now + CRASH_COOLDOWN_SECONDS
                     print(f"[CAM{cam_idx}] ✅ CRASH CONFIRMED after {cs['elapsed']:.1f}s")
+                    threading.Thread(
+                        target=crash_pipeline,
+                        args=(cam_idx, now),
+                        daemon=True
+                    ).start()
             else:
-                if cs["first_seen"] is not None:
-                    held = now - cs["first_seen"]
-                    if not cs["confirmed"]:
-                        print(f"[CAM{cam_idx}] ❌ Detection cleared after {held:.1f}s — FALSE ALARM")
-                cs["first_seen"]   = None
-                cs["elapsed"]      = 0.0
-                cs["confirmed"]    = False
-                cs["confirmed_at"] = None
-                cs["boxes"]        = []
+                if cs["first_seen"] is not None and not cs["confirmed"]:
+                    print(f"[CAM{cam_idx}] ❌ False alarm cleared after {now - cs['first_seen']:.1f}s")
+                cs.update({"first_seen": None, "elapsed": 0.0,
+                           "confirmed": False, "confirmed_at": None, "boxes": []})
     except Exception as e:
         print(f"ML detection error cam{cam_idx}: {e}")
 
-# ─────────────────── OVERLAY ─────────────────────────
+# ═════════════════════════════════════════════════════
+# CRASH PIPELINE
+# ═════════════════════════════════════════════════════
+
+def crash_pipeline(cam_idx: int, confirmed_at: float):
+    session_id  = f"crash_{int(confirmed_at)}_cam{cam_idx}"
+    session_dir = os.path.join(RECORD_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    cancel_event = threading.Event()
+
+    with crash_record_lock:
+        crash_record_state.update({
+            "active":       True,
+            "session_id":   session_id,
+            "cancel_event": cancel_event,
+            "confirmed_at": confirmed_at,
+            "cam_idx":      cam_idx,
+            "seconds_left": float(CRASH_COOLDOWN_SECONDS),
+        })
+
+    print(f"[CRASH] Pipeline → {session_id}")
+
+    # ═ PHASE 1: Record pre-crash frames from ring buffer
+    with ring_buffer_lock:
+        pre_frames = list(ring_buffer)
+
+    pre_paths = []
+    for i, (ts, frame_bytes) in enumerate(pre_frames):
+        path = os.path.join(session_dir, f"frame_{i:05d}.jpg")
+        with open(path, 'wb') as f:
+            f.write(frame_bytes)
+        pre_paths.append(path)
+    print(f"[CRASH] Saved {len(pre_paths)} pre-crash frames")
+
+    # ═ PHASE 2: Record post-crash frames (10s)
+    post_paths     = []
+    frame_idx      = len(pre_paths)
+    deadline       = time.time() + RECORD_POST_SECONDS
+    frame_interval = 1.0 / RECORD_FPS
+
+    while time.time() < deadline and not cancel_event.is_set():
+        with combined_frame_lock:
+            frame = combined_frame
+        if frame:
+            path = os.path.join(session_dir, f"frame_{frame_idx:05d}.jpg")
+            with open(path, 'wb') as f:
+                f.write(frame)
+            post_paths.append(path)
+            frame_idx += 1
+        time.sleep(frame_interval)
+    print(f"[CRASH] Saved {len(post_paths)} post-crash frames")
+
+    # ═ PHASE 3: Wait for cancel window (send heartbeats to Relay)
+    cancel_deadline = confirmed_at + CRASH_COOLDOWN_SECONDS
+    heartbeat_thread = threading.Thread(
+        target=_send_heartbeats,
+        args=(session_id, cancel_deadline, cancel_event),
+        daemon=True
+    )
+    heartbeat_thread.start()
+
+    while time.time() < cancel_deadline and not cancel_event.is_set():
+        with crash_record_lock:
+            crash_record_state["seconds_left"] = max(0.0, cancel_deadline - time.time())
+        time.sleep(0.25)
+
+    with crash_record_lock:
+        crash_record_state["active"]       = False
+        crash_record_state["seconds_left"] = 0.0
+
+    if cancel_event.is_set():
+        print(f"[CRASH] Cancelled — removing session {session_id}")
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return
+
+    print(f"[CRASH] Cancel window expired — compiling + sending to Relay")
+
+    # ═ PHASE 4: Compile video on Pi
+    snapshot_path = pre_paths[-1] if pre_paths else (post_paths[0] if post_paths else None)
+    video_path    = os.path.join(session_dir, "crash_clip.mp4")
+    compiled      = _compile_video(session_dir, video_path)
+
+    # ═ PHASE 5: Get GPS + send to Relay with video
+    with gps_state_lock:
+        lat   = gps_state.get("lat")
+        lon   = gps_state.get("lon")
+        speed = gps_state.get("speed")
+
+    location_str = f"{lat:.5f}, {lon:.5f}" if lat and lon else "Unknown"
+    speed_str    = f"{speed:.1f} km/h"     if speed      else "Unknown"
+    cam_label    = "FRONT" if cam_idx == 0 else "REAR"
+
+    # Convert video + snapshot to base64 for Relay
+    snapshot_b64 = None
+    video_b64    = None
+
+    if snapshot_path and os.path.exists(snapshot_path):
+        try:
+            with open(snapshot_path, 'rb') as f:
+                snapshot_b64 = base64.b64encode(f.read()).decode('utf-8')
+            print(f"[CRASH] Snapshot encoded ({len(snapshot_b64)//1024}KB)")
+        except Exception as e:
+            print(f"[CRASH] Snapshot encoding error: {e}")
+
+    if compiled and video_path and os.path.exists(video_path):
+        try:
+            with open(video_path, 'rb') as f:
+                video_b64 = base64.b64encode(f.read()).decode('utf-8')
+            print(f"[CRASH] Video encoded ({len(video_b64)//1024}KB)")
+        except Exception as e:
+            print(f"[CRASH] Video encoding error: {e}")
+
+    # Send alert to Relay (Relay will upload to Firebase + send email)
+    _send_crash_to_relay(
+        session_id   = session_id,
+        device_id    = DEVICE_ID,
+        rider_email  = OWNER_EMAIL,
+        cam_label    = cam_label,
+        location     = location_str,
+        speed        = speed_str,
+        snapshot_b64 = snapshot_b64,
+        video_b64    = video_b64,
+    )
+
+    # Clean up local session dir
+    shutil.rmtree(session_dir, ignore_errors=True)
+    print(f"[CRASH] Session cleaned up locally")
+
+
+def _send_heartbeats(session_id: str, deadline: float, cancel_event):
+    """Send heartbeat to Relay every 2s to prove Pi is alive"""
+    while time.time() < deadline and not cancel_event.is_set():
+        try:
+            resp = req_lib.post(
+                f"{RELAY_URL}/api/crash/heartbeat",
+                json={"session_id": session_id, "device_id": DEVICE_ID},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                print(f"[RELAY] ❤️ Heartbeat sent")
+            else:
+                print(f"[RELAY] ⚠️ Heartbeat failed ({resp.status_code})")
+        except Exception as e:
+            print(f"[RELAY] ⚠️ Heartbeat error: {e}")
+        time.sleep(2)
+
+
+def _send_crash_to_relay(session_id: str, device_id: str, rider_email: str,
+                         cam_label: str, location: str, speed: str,
+                         snapshot_b64: str | None, video_b64: str | None) -> bool:
+    """Send crash alert + video to Relay"""
+    try:
+        payload = {
+            "session_id":      session_id,
+            "device_id":       device_id,
+            "rider_email":     rider_email,
+            "cam_label":       cam_label,
+            "location":        location,
+            "speed":           speed,
+            "snapshot_base64": snapshot_b64,
+            "video_base64":    video_b64,
+        }
+
+        resp = req_lib.post(
+            f"{RELAY_URL}/api/crash/alert",
+            json=payload,
+            timeout=120  # Large timeout for video upload
+        )
+
+        if resp.status_code == 200:
+            result = resp.json()
+            print(f"[RELAY] ✅ Crash alert sent: {result.get('message')}")
+            return True
+        else:
+            print(f"[RELAY] ❌ Failed ({resp.status_code}): {resp.text[:200]}")
+            return False
+
+    except Exception as e:
+        print(f"[RELAY] ❌ Error sending crash: {e}")
+        return False
+
+
+def _compile_video(session_dir: str, output_path: str) -> bool:
+    try:
+        all_jpgs  = sorted(glob.glob(os.path.join(session_dir, "frame_*.jpg")))
+        list_path = os.path.join(session_dir, "frames.txt")
+        with open(list_path, 'w') as f:
+            for p in all_jpgs:
+                f.write(f"file '{p}'\n")
+                f.write(f"duration {1.0 / RECORD_FPS}\n")
+
+        result = subprocess.run([
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+            '-i',       list_path,
+            '-vf',      f'scale={COMBINED_W}:{COMBINED_H}',
+            '-c:v',     'libx264',
+            '-preset',  'fast',
+            '-crf',     '28',
+            '-pix_fmt', 'yuv420p',
+            output_path
+        ], capture_output=True, timeout=90)
+
+        if result.returncode == 0:
+            print(f"[VIDEO] Compiled → {output_path}")
+            return True
+        print(f"[VIDEO] ffmpeg error: {result.stderr.decode()}")
+        return False
+    except Exception as e:
+        print(f"[VIDEO] Compile error: {e}")
+        return False
+
+# ═════════════════════════════════════════════════════
+# EMAIL QUEUE + SENDER
+# ═════════════════════════════════════════════════════
+
+def _enqueue_email(to, subject, body, image_path, video_path, session_dir):
+    with _email_queue_lock:
+        _email_queue.append({
+            "to":          to,
+            "subject":     subject,
+            "body":        body,
+            "image_path":  image_path,
+            "video_path":  video_path,
+            "session_dir": session_dir,
+            "attempts":    0,
+        })
+    print(f"[EMAIL] Queued → {to}  (total queued: {len(_email_queue)})")
+
+
+def email_sender_worker():
+    print("[EMAIL] Sender worker started")
+    while True:
+        with _email_queue_lock:
+            pending = list(_email_queue)
+
+        if not pending:
+            time.sleep(5); continue
+
+        if not has_internet():
+            print(f"[EMAIL] No internet — {len(pending)} email(s) queued, waiting…")
+            time.sleep(15); continue
+
+        sent_indices = []
+        for i, item in enumerate(pending):
+            ok = _send_email(
+                to         = item["to"],
+                subject    = item["subject"],
+                body       = item["body"],
+                image_path = item.get("image_path"),
+                video_path = item.get("video_path"),
+            )
+            if ok:
+                sent_indices.append(i)
+                session_dir = item.get("session_dir")
+                if session_dir and os.path.isdir(session_dir):
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                    print(f"[EMAIL] Cleaned up session: {session_dir}")
+            else:
+                item["attempts"] += 1
+                print(f"[EMAIL] Retry #{item['attempts']} for {item['to']}")
+
+        if sent_indices:
+            with _email_queue_lock:
+                for i in sorted(sent_indices, reverse=True):
+                    if i < len(_email_queue):
+                        _email_queue.pop(i)
+
+        time.sleep(10)
+
+
+def _send_email(to: str, subject: str, body: str,
+                image_path: str | None = None,
+                video_path: str | None = None) -> bool:
+    try:
+        msg            = MIMEMultipart()
+        msg['From']    = SMTP_USER
+        msg['To']      = to
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        if image_path and os.path.exists(image_path):
+            with open(image_path, 'rb') as f:
+                part = MIMEBase('image', 'jpeg')
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment; filename="crash_snapshot.jpg"')
+            msg.attach(part)
+
+        if video_path and os.path.exists(video_path):
+            with open(video_path, 'rb') as f:
+                part = MIMEBase('video', 'mp4')
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment; filename="crash_clip.mp4"')
+            msg.attach(part)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo(); server.starttls(); server.ehlo()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, to, msg.as_string())
+
+        print(f"[EMAIL] ✅ Sent to {to}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL] ❌ Failed ({to}): {e}")
+        return False
+
+# ═════════════════════════════════════════════════════
+# RING BUFFER WORKER
+# ═════════════════════════════════════════════════════
+
+def ring_buffer_worker():
+    interval   = 1.0 / RECORD_FPS
+    last_frame = None
+    print("[RING] Buffer worker started")
+    while True:
+        time.sleep(interval)
+        with combined_frame_lock:
+            frame = combined_frame
+        if frame is None or frame is last_frame:
+            continue
+        last_frame = frame
+        with ring_buffer_lock:
+            ring_buffer.append((time.time(), frame))
+
+# ═════════════════════════════════════════════════════
+# OVERLAY
+# ═════════════════════════════════════════════════════
+
 def add_overlay(cam_idx, frame_bytes, mode='center'):
     try:
         img  = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
         draw = ImageDraw.Draw(img, 'RGBA')
         try:
-            font  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 18)
-            sfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
+            font  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
+            sfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
         except Exception:
-            font  = ImageFont.load_default()
-            sfont = font
+            font = sfont = ImageFont.load_default()
 
         badge_col = (0, 200, 255, 220) if cam_idx == 0 else (255, 100, 0, 220)
-        draw.rectangle([4, 4, 120, 28], fill=badge_col)
+        draw.rectangle([4, 4, 110, 26], fill=badge_col)
         draw.text((8, 6), cameras[cam_idx]["label"], fill=(0,0,0,255), font=font)
 
         with detection_lock:
@@ -251,8 +823,8 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
                 text_bg    = (200, 0, 0, 220)
                 status_tag = "CONFIRMED"
             elif cs["first_seen"] is not None and not cs["confirmed"]:
-                pct  = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
-                fill = int(pct * 255)
+                pct        = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
+                fill       = int(pct * 255)
                 box_color  = (255, fill, 0, 255)
                 text_bg    = (160, 100, 0, 200)
                 status_tag = f"VERIFYING {cs['elapsed']:.1f}/{CRASH_CONFIRM_SECONDS}s"
@@ -260,51 +832,56 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
                 continue
             draw.rectangle([x1,y1,x2,y2], outline=box_color, width=3)
             text = f"{b['label']} {b['conf']*100:.0f}% {b['side']} | {status_tag}"
-            tw   = len(text) * 8
-            draw.rectangle([x1, max(0,y1-22), x1+tw, y1], fill=text_bg)
-            draw.text((x1+2, max(0,y1-20)), text, fill=(255,255,255,255), font=sfont)
+            tw   = len(text) * 7
+            draw.rectangle([x1, max(0,y1-20), x1+tw, y1], fill=text_bg)
+            draw.text((x1+2, max(0,y1-18)), text, fill=(255,255,255,255), font=sfont)
 
         if cs["first_seen"] is not None and not cs["confirmed"]:
-            pct  = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
+            pct    = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
             iw, ih = img.size
-            bar_w = int(iw * pct)
+            bar_w  = int(iw * pct)
             draw.rectangle([0, ih-8, iw, ih], fill=(40,40,40,200))
             draw.rectangle([0, ih-8, bar_w, ih], fill=(255, int(255*(1-pct)), 0, 220))
 
         out = io.BytesIO()
-        img.save(out, format='JPEG', quality=92)
+        img.save(out, format='JPEG', quality=70)
         return out.getvalue()
     except Exception as e:
         print(f"Overlay error cam{cam_idx}: {e}")
         return frame_bytes
 
-# ─────────────────── COMBINE FRAMES ─────────────────
+# ═════════════════════════════════════════════════════
+# COMBINE FRAMES (360°)
+# ═════════════════════════════════════════════════════
+
 def combine_frames(front_bytes, rear_bytes):
     try:
-        # ← LANCZOS for sharp resize (was default bilinear)
-        front = Image.open(io.BytesIO(front_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT), Image.LANCZOS)
-        rear  = Image.open(io.BytesIO(rear_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT), Image.LANCZOS)
-        canvas = Image.new('RGB', (COMBINED_W, COMBINED_H + 32), (10, 10, 10))
-        canvas.paste(front, (0, 32))
-        canvas.paste(rear,  (CAM_WIDTH, 32))
-        draw = ImageDraw.Draw(canvas)
+        front  = Image.open(io.BytesIO(front_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT), Image.LANCZOS)
+        rear   = Image.open(io.BytesIO(rear_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT), Image.LANCZOS)
+        canvas = Image.new('RGB', (COMBINED_W, COMBINED_H + 30), (10, 10, 10))
+        canvas.paste(front, (0, 30))
+        canvas.paste(rear,  (CAM_WIDTH, 30))
+        draw  = ImageDraw.Draw(canvas)
         try:
-            hfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 18)
+            hfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
         except Exception:
             hfont = ImageFont.load_default()
-        draw.rectangle([0, 0, COMBINED_W, 32], fill=(10, 10, 10))
-        draw.text((8, 8),            "◀ FRONT", fill=(0, 200, 255), font=hfont)
-        draw.text((CAM_WIDTH + 8, 8),"REAR ▶",  fill=(255, 120, 0), font=hfont)
-        draw.line([(CAM_WIDTH,0),(CAM_WIDTH,COMBINED_H+32)], fill=(40,40,40), width=2)
+        draw.rectangle([0, 0, COMBINED_W, 30], fill=(10, 10, 10))
+        draw.text((8, 7),             "◀ FRONT", fill=(0, 200, 255), font=hfont)
+        draw.text((CAM_WIDTH + 8, 7), "REAR ▶",  fill=(255, 120, 0),  font=hfont)
+        draw.line([(CAM_WIDTH,0),(CAM_WIDTH,COMBINED_H+30)], fill=(40,40,40), width=2)
         ts = time.strftime("%Y-%m-%d  %H:%M:%S")
-        draw.text((COMBINED_W//2 - 90, 8), ts, fill=(180,180,180), font=hfont)
+        draw.text((COMBINED_W//2 - 90, 7), ts, fill=(180,180,180), font=hfont)
         out = io.BytesIO()
-        canvas.save(out, format='JPEG', quality=92)
+        canvas.save(out, format='JPEG', quality=85)
         return out.getvalue()
     except Exception as e:
         print(f"Combine error: {e}"); return front_bytes
 
-# ─────────────────── CAMERA THREAD ──────────────────
+# ═════════════════════════════════════════════════════
+# CAMERA THREAD
+# ═════════════════════════════════════════════════════
+
 def kill_existing_cameras():
     try:
         subprocess.run(['pkill','-f','rpicam-vid'], capture_output=True)
@@ -325,11 +902,16 @@ def camera_thread(cam_idx):
                  '--height',    str(CAM_HEIGHT),
                  '--framerate', str(CAM_FPS),
                  '--codec',     'mjpeg',
-                 '--quality',   '90',
-                 '--sharpness', '2.0',   # ← sharp!
-                 '--contrast',  '1.1',   # ← pop
-                 '--awb',       'auto',  # ← correct white balance
-                 '--inline', '--nopreview', '--denoise', 'off',
+                 '--quality',   '85',
+                 '--sharpness', '1.0',
+                 '--contrast',  '1.0',
+                 '--brightness','0.1',
+                 '--awb',       'auto',
+                 '--metering',  'average',
+                 '--ev',        '1.5',
+                 '--gain',      '4.0',
+                 '--denoise',   'off',
+                 '--inline', '--nopreview',
                  '--flush', '1', '-o', '-'],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             SOI=b'\xff\xd8'; EOI=b'\xff\xd9'; buffer=b''
@@ -352,7 +934,7 @@ def camera_thread(cam_idx):
                     eoi=buffer.find(EOI,soi+2)
                     if eoi==-1: break
                     frame=buffer[soi:eoi+2]; buffer=buffer[eoi+2:]
-                    if len(frame)<1024: continue
+                    if len(frame)<2048: continue
                     last_frame_time=time.time(); frames_captured+=1
                     with cam["frame_lock"]:
                         cam["latest_frame"]=frame
@@ -373,7 +955,10 @@ def camera_thread(cam_idx):
         set_cam_status(cam_idx,f"Restarting in {delay}s...")
         time.sleep(delay)
 
-# ─────────────────── WORKERS ─────────────────────────
+# ═════════════════════════════════════════════════════
+# WORKERS
+# ═════════════════════════════════════════════════════
+
 def overlay_worker():
     last={0:None,1:None}; skip={0:0,1:0}
     while True:
@@ -383,7 +968,7 @@ def overlay_worker():
             with cam["frame_lock"]: frame=cam["latest_frame"]
             if frame is None or frame is last[idx]: continue
             last[idx]=frame
-            if color_detection_enabled and skip[idx]%2==0:
+            if color_detection_enabled and skip[idx]%3==0:
                 detect_colors_in_frame(idx,frame,detection_mode)
             skip[idx]+=1
             rendered=add_overlay(idx,frame,detection_mode)
@@ -417,45 +1002,6 @@ def ml_worker():
             last[idx]=frame
             detect_accidents_in_frame(idx,frame)
 
-# ─────────────────── CLOUD SENDER ───────────────────
-def cloud_sender():
-    if not CLOUD_ENABLED: return
-    session=req_lib.Session()
-    session.headers.update({"X-Secret":PUSH_SECRET})
-    lf=ls=lg=lm=0; last_sent=None
-    print(f"[CLOUD] Sender started → {CLOUD_URL}")
-    while True:
-        now=time.time()
-        if now-lf>=1.0:
-            with combined_frame_lock: frame=combined_frame
-            if frame and frame is not last_sent:
-                try:
-                    r=session.post(f"{CLOUD_URL}/push/frame",data=frame,
-                                   headers={"Content-Type":"image/jpeg"},timeout=8)
-                    if r.status_code==200: last_sent=frame; lf=now
-                    elif r.status_code==401: print("[CLOUD] ❌ Wrong secret")
-                except Exception as e: print(f"[CLOUD] Frame: {e}")
-        if now-lm>=0.5:
-            with confirm_lock:
-                payload={str(idx):{
-                    "confirmed": confirm_state[idx]["confirmed"],
-                    "elapsed":   round(confirm_state[idx]["elapsed"],1),
-                    "boxes":     confirm_state[idx]["boxes"]
-                } for idx in (0,1)}
-            try: session.post(f"{CLOUD_URL}/push/ml",json=payload,timeout=5); lm=now
-            except Exception: pass
-        if now-ls>=10.0:
-            s={str(idx):cameras[idx]["status"] for idx in (0,1)}
-            try: session.post(f"{CLOUD_URL}/push/status",json=s,timeout=5); ls=now
-            except Exception: pass
-        if now-lg>=10.0:
-            with gps_state_lock: gps=gps_state.copy()
-            if gps['lat'] and gps['lon']:
-                try: session.post(f"{CLOUD_URL}/push/gps",json=gps,timeout=5); lg=now
-                except Exception: pass
-        time.sleep(0.5)
-
-# ─────────────────── GPS WORKER ─────────────────────
 def gps_worker():
     def push(lat,lon,speed):
         with gps_state_lock: gps_state.update({"lat":lat,"lon":lon,"speed":speed})
@@ -477,9 +1023,12 @@ def gps_worker():
     except ImportError:
         if STATIC_LAT and STATIC_LON:
             while True: push(STATIC_LAT,STATIC_LON,0); time.sleep(30)
-        else: print("[GPS] No GPS configured")
+        else: print("[GPS] No GPS module configured")
 
-# ─────────────────── FRAME GENERATORS ────────────────
+# ═════════════════════════════════════════════════════
+# FRAME GENERATORS
+# ═════════════════════════════════════════════════════
+
 def _gen_single(cam_idx):
     cameras[cam_idx]["frame_ready"].wait(timeout=15)
     last=None; stall=0
@@ -506,7 +1055,66 @@ def generate_combined():
         stall=0; last=frame
         yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame+b'\r\n'
 
-# ─────────────────── ROUTES ─────────────────────────
+# ═════════════════════════════════════════════════════
+# FLASK ROUTES
+# ═════════════════════════════════════════════════════
+
+@app.before_request
+def handle_cors():
+    if request.method == 'OPTIONS':
+        r = app.make_default_options_response()
+        r.headers['Access-Control-Allow-Origin']  = '*'
+        r.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return r
+
+@app.after_request
+def after_request(response):
+    response.headers['Access-Control-Allow-Origin']  = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
+@app.route('/crash_alert')
+def crash_alert():
+    with crash_record_lock:
+        state = dict(crash_record_state)
+    if not state["active"]:
+        return jsonify({"active": False})
+    return jsonify({
+        "active":       True,
+        "session_id":   state["session_id"],
+        "seconds_left": round(state["seconds_left"], 1),
+        "confirmed_at": state["confirmed_at"],
+        "cam_idx":      state["cam_idx"],
+    })
+
+# ── Single crash_cancel route (includes Relay notification) ──
+@app.route('/crash_cancel', methods=['POST'])
+def crash_cancel():
+    with crash_record_lock:
+        event      = crash_record_state.get("cancel_event")
+        active     = crash_record_state.get("active", False)
+        session_id = crash_record_state.get("session_id")
+    if not active or event is None:
+        return jsonify({"error": "No active crash alert"}), 400
+    event.set()
+    print("[CRASH] Cancel received")
+
+    # Notify Relay to cancel the alert
+    if session_id:
+        try:
+            req_lib.post(
+                f"{RELAY_URL}/api/crash/cancel",
+                json={"session_id": session_id},
+                timeout=5
+            )
+            print(f"[RELAY] Cancel notification sent")
+        except Exception as e:
+            print(f"[RELAY] Cancel notification failed: {e}")
+
+    return jsonify({"success": True, "message": "Cancelled. Recording deleted."})
+
 @app.route('/stream')
 def stream_combined():
     return Response(generate_combined(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -522,40 +1130,35 @@ def stream_rear():
 @app.route('/snapshot.jpg')
 def snapshot():
     with combined_frame_lock: frame=combined_frame
-    if frame is None: return "No frame",503
-    return Response(frame,mimetype='image/jpeg')
+    if frame is None: return "No frame", 503
+    return Response(frame, mimetype='image/jpeg')
 
 @app.route('/snapshot/<int:cam_idx>.jpg')
 def snapshot_cam(cam_idx):
-    if cam_idx not in cameras: return "Invalid camera",404
+    if cam_idx not in cameras: return "Invalid camera", 404
     with cameras[cam_idx]["overlay_lock"]: frame=cameras[cam_idx]["overlay_frame"]
     if frame is None:
         with cameras[cam_idx]["frame_lock"]: frame=cameras[cam_idx]["latest_frame"]
-    if frame is None: return "No frame",503
-    return Response(frame,mimetype='image/jpeg')
+    if frame is None: return "No frame", 503
+    return Response(frame, mimetype='image/jpeg')
 
-@app.route('/detection',methods=['GET','POST'])
+@app.route('/detection', methods=['GET','POST'])
 def detection():
-    global color_detection_enabled,detection_mode
-    if request.method=='POST':
-        d=request.get_json()
-        color_detection_enabled=d.get('enabled',False)
-        detection_mode=d.get('mode','center')
+    global color_detection_enabled, detection_mode
+    if request.method == 'POST':
+        d = request.get_json()
+        color_detection_enabled = d.get('enabled', False)
+        detection_mode          = d.get('mode', 'center')
         return jsonify({'success':True,'enabled':color_detection_enabled,'mode':detection_mode})
     return jsonify({'enabled':color_detection_enabled,'mode':detection_mode})
 
-@app.route('/ml',methods=['GET','POST'])
+@app.route('/ml', methods=['GET','POST'])
 def ml_toggle():
     global ml_detection_enabled
-    if request.method=='POST':
-        ml_detection_enabled=request.get_json().get('enabled',False)
+    if request.method == 'POST':
+        ml_detection_enabled = request.get_json().get('enabled', False)
         return jsonify({'success':True,'enabled':ml_detection_enabled})
     return jsonify({'enabled':ml_detection_enabled})
-
-@app.route('/colors')
-def get_colors():
-    with detection_lock:
-        return jsonify({'front':detected_colors[0],'rear':detected_colors[1]})
 
 @app.route('/ml_results')
 def get_ml_results():
@@ -580,11 +1183,30 @@ def get_status():
 def get_gps():
     with gps_state_lock: return jsonify(gps_state)
 
+@app.route('/device/info')
+def device_info():
+    return jsonify({
+        "device_id":           DEVICE_ID,
+        "owner_email":         OWNER_EMAIL,
+        "resolution":          f"{CAM_WIDTH}x{CAM_HEIGHT}",
+        "fps":                 CAM_FPS,
+        "combined_resolution": f"{COMBINED_W}x{COMBINED_H}",
+        "crash_confirm_secs":  CRASH_CONFIRM_SECONDS,
+        "cancel_window_secs":  CRASH_COOLDOWN_SECONDS,
+        "record_pre_secs":     RECORD_PRE_SECONDS,
+        "record_post_secs":    RECORD_POST_SECONDS,
+    })
+
+@app.route('/email_queue_status')
+def email_queue_status():
+    with _email_queue_lock:
+        items = [{"to": i["to"], "attempts": i["attempts"]} for i in _email_queue]
+    return jsonify({"queued": len(items), "items": items, "internet": has_internet()})
+
 @app.route('/ping')
 def ping():
     return 'pong', 200
 
-# ─────────────────── HTML UI ────────────────────────
 @app.route('/')
 def index():
     html = r'''<!DOCTYPE html>
@@ -592,443 +1214,99 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pi Dual Cam — 360 View</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<title>PiCAM 360</title>
 <style>
-:root {
-  --cyan:#00e5ff; --orange:#ff6d00; --green:#00e676;
-  --red:#ff1744;  --yellow:#ffd600;
-  --bg:#050a0e;   --panel:#0a1520; --border:#1a2e40;
-  --text:#c8d8e8; --dim:#4a6070;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;min-height:100vh}
-
-.header{display:flex;align-items:center;justify-content:space-between;
-  padding:10px 20px;
-  background:linear-gradient(135deg,#050a0e 60%,#0a1a28);
-  border-bottom:1px solid var(--border)}
-.header-title{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:22px;
-  letter-spacing:3px;color:var(--cyan);text-shadow:0 0 12px rgba(0,229,255,.5)}
-.header-title span{color:var(--orange)}
-.header-status{display:flex;gap:16px;font-size:11px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--dim);display:inline-block;
-  margin-right:4px;box-shadow:0 0 4px currentColor;transition:background .3s}
+:root{--cyan:#00e5ff;--orange:#ff6d00;--green:#00e676;--red:#ff1744;--yellow:#ffd600;--bg:#050a0e;--panel:#0a1520;--border:#1a2e40;--text:#c8d8e8;--dim:#4a6070}
+*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:monospace;min-height:100vh}
+.header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#050a0e;border-bottom:1px solid var(--border)}
+.logo{font-weight:700;font-size:20px;letter-spacing:3px;color:var(--cyan)}.logo span{color:var(--orange)}
+.hdr-right{display:flex;gap:14px;font-size:11px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--dim);display:inline-block;margin-right:4px;transition:background .3s}
 .dot.live{background:var(--green)}.dot.warn{background:var(--orange)}
-
-.view-bar{display:flex;justify-content:center;gap:8px;padding:10px 20px;
-  background:var(--panel);border-bottom:1px solid var(--border)}
-.vbtn{font-family:'Rajdhani',sans-serif;font-weight:600;font-size:13px;letter-spacing:1px;
-  padding:6px 20px;border:1px solid var(--border);background:transparent;
-  color:var(--dim);cursor:pointer;transition:all .2s}
-.vbtn:hover{border-color:var(--cyan);color:var(--cyan)}
-.vbtn.active{background:var(--cyan);color:#000;border-color:var(--cyan)}
-
-.stream-wrapper{position:relative;background:#000;display:flex;justify-content:center;
-  border-bottom:2px solid var(--border);overflow:hidden}
-
-/* ← FIXED: was 2560px causing stretch blur */
-.stream-combined{width:100%;max-width:1280px;display:block;image-rendering:crisp-edges}
-.stream-single{width:100%;max-width:640px;display:block;image-rendering:crisp-edges}
-.stream-split{display:flex;width:100%;max-width:1280px}
-.stream-split img{width:50%;display:block;image-rendering:crisp-edges}
-
-.split-divider{width:3px;background:linear-gradient(to bottom,var(--cyan),var(--orange));flex-shrink:0;z-index:2}
-.cam-label{position:absolute;top:8px;font-size:12px;font-family:'Rajdhani',sans-serif;
-  font-weight:700;letter-spacing:2px;padding:3px 10px;pointer-events:none}
-.cam-label-front{left:10px;background:rgba(0,229,255,.2);color:var(--cyan);border:1px solid var(--cyan)}
-.cam-label-rear{right:10px;background:rgba(255,109,0,.2);color:var(--orange);border:1px solid var(--orange)}
-#reconnect-msg{text-align:center;color:var(--orange);font-size:12px;min-height:18px;padding:4px}
-
-.bottom-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:14px 20px}
-@media(max-width:900px){.bottom-grid{grid-template-columns:1fr 1fr}}
-@media(max-width:580px){.bottom-grid{grid-template-columns:1fr}}
-.panel{background:var(--panel);border:1px solid var(--border);padding:12px 14px}
-.panel-title{font-family:'Rajdhani',sans-serif;font-weight:600;font-size:12px;
-  letter-spacing:2px;color:var(--dim);margin-bottom:10px;text-transform:uppercase;
-  border-bottom:1px solid var(--border);padding-bottom:6px}
-
-.ctrl-row{display:flex;gap:8px;flex-wrap:wrap}
-.btn{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:13px;letter-spacing:1px;
-  padding:8px 14px;border:1px solid var(--border);background:transparent;
-  color:var(--text);cursor:pointer;transition:all .2s;flex:1;text-align:center}
-.btn:hover{border-color:var(--cyan);color:var(--cyan)}
-.btn.active-cyan{background:rgba(0,229,255,.15);color:var(--cyan);border-color:var(--cyan);
-  box-shadow:0 0 8px rgba(0,229,255,.3)}
-.btn.active-orange{background:rgba(255,109,0,.15);color:var(--orange);border-color:var(--orange);
-  box-shadow:0 0 8px rgba(255,109,0,.3)}
-
-.ml-cam-section{margin-bottom:10px}
-.ml-cam-header{font-size:11px;letter-spacing:2px;margin-bottom:6px;padding:3px 8px;display:inline-block}
-.ml-cam-front-h{background:rgba(0,229,255,.15);color:var(--cyan);border:1px solid var(--cyan)}
-.ml-cam-rear-h{background:rgba(255,109,0,.15);color:var(--orange);border:1px solid var(--orange)}
-
-.confirm-bar-wrap{background:#0d1e2e;border:1px solid var(--border);
-  border-radius:2px;height:10px;margin:6px 0;overflow:hidden;position:relative}
-.confirm-bar-fill{height:100%;transition:width .4s linear;border-radius:2px}
-.confirm-bar-label{font-size:10px;color:var(--dim);margin-top:2px}
-
-.alert-confirmed{border:2px solid var(--red);background:rgba(255,23,68,.1);
-  padding:8px 10px;margin-bottom:6px;animation:pulseAlert 1s infinite alternate}
-@keyframes pulseAlert{from{box-shadow:0 0 4px var(--red)}to{box-shadow:0 0 16px var(--red)}}
-.alert-title{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:15px;
-  color:var(--red);letter-spacing:2px}
-.alert-detail{font-size:11px;color:#ffb3b3;margin-top:3px}
-
-.ml-none{color:var(--dim);font-size:12px}
-.stat-row{display:flex;justify-content:space-between;font-size:11px;padding:3px 0}
-.stat-key{color:var(--dim)}
-.stat-val{color:var(--text);max-width:180px;text-align:right;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
-.stat-val.ok{color:var(--green)}.stat-val.err{color:var(--red)}
-
-.gps-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.gps-val{font-size:18px;font-weight:bold;color:var(--green);font-family:'Rajdhani',sans-serif}
-.gps-key{font-size:10px;color:var(--dim);letter-spacing:1px}
-#map{height:220px;border:1px solid var(--border);margin-top:8px}
-#maplink{font-size:11px;color:var(--cyan);margin-top:4px;display:none;text-decoration:none}
-#maplink:hover{text-decoration:underline}
-#color-panel{font-size:11px}
-
-@keyframes recblink{0%,100%{opacity:1}50%{opacity:0}}
-.rec-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
-  background:var(--red);animation:recblink 1.2s infinite;margin-right:4px}
-::-webkit-scrollbar{width:4px}
-::-webkit-scrollbar-thumb{background:var(--border)}
+.view-bar{display:flex;justify-content:center;gap:6px;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.vbtn{font-size:11px;letter-spacing:1px;padding:6px 14px;border:1px solid var(--border);background:transparent;color:var(--dim);cursor:pointer;transition:all .2s}
+.vbtn:hover{border-color:var(--cyan);color:var(--cyan)}.vbtn.active{background:var(--cyan);color:#000;border-color:var(--cyan)}
+.stream-wrapper{background:#000;display:flex;justify-content:center;align-items:center;border-bottom:2px solid var(--border);overflow:hidden;position:relative;max-height:56vh}
+.stream-360{max-width:100%;max-height:56vh;width:auto;height:auto;display:block;object-fit:contain}
+.stream-single{max-width:100%;max-height:56vh;width:auto;height:auto;display:block}
+.stream-split{display:flex;width:100%;max-height:56vh}.stream-split img{width:50%;max-height:56vh;object-fit:contain;display:block}
+.split-div{width:2px;background:linear-gradient(to bottom,var(--cyan),var(--orange));flex-shrink:0}
+.cam-lbl{position:absolute;top:8px;font-size:10px;font-weight:700;letter-spacing:2px;padding:3px 8px;pointer-events:none}
+.cam-lbl-f{left:10px;background:rgba(0,229,255,.2);color:var(--cyan);border:1px solid var(--cyan)}
+.cam-lbl-r{right:10px;background:rgba(255,109,0,.2);color:var(--orange);border:1px solid var(--orange)}
+#crash-banner{display:none;padding:10px 16px;background:#1a0000;border-bottom:3px solid var(--red);align-items:center;justify-content:space-between}
+.crash-info{color:var(--red);font-weight:700;font-size:14px;letter-spacing:1px}.crash-secs{color:var(--orange);font-weight:700}
+.cancel-btn{background:#065f46;border:1px solid var(--green);color:var(--green);padding:7px 16px;cursor:pointer;font-weight:700;font-size:11px;letter-spacing:1px}
+.cancel-btn:hover{background:#0a7a58}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding:12px 16px}
+@media(max-width:1200px){.grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--border);padding:10px 12px}
+.ptitle{font-size:10px;letter-spacing:2px;color:var(--dim);margin-bottom:8px;text-transform:uppercase;border-bottom:1px solid var(--border);padding-bottom:5px}
+.ctrl-row{display:flex;gap:6px;flex-wrap:wrap}
+.btn{font-size:11px;letter-spacing:1px;padding:7px 10px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .2s;flex:1;text-align:center}
+.btn:hover{border-color:var(--cyan);color:var(--cyan)}.btn.on-org{background:rgba(255,109,0,.15);color:var(--orange);border-color:var(--orange)}
+.ml-sec{margin-bottom:8px}.ml-hdr{font-size:10px;letter-spacing:2px;margin-bottom:5px;padding:3px 7px;display:inline-block}
+.ml-hdr-f{background:rgba(0,229,255,.15);color:var(--cyan);border:1px solid var(--cyan)}
+.ml-hdr-r{background:rgba(255,109,0,.15);color:var(--orange);border:1px solid var(--orange)}
+.bar-wrap{background:#0d1e2e;border:1px solid var(--border);height:8px;margin:5px 0;overflow:hidden;border-radius:2px}
+.bar-fill{height:100%;transition:width .4s linear;border-radius:2px}
+.alert-box{border:2px solid var(--red);background:rgba(255,23,68,.1);padding:6px 8px;margin-bottom:5px;animation:pulse 1s infinite alternate}
+@keyframes pulse{from{box-shadow:0 0 4px var(--red)}to{box-shadow:0 0 14px var(--red)}}
+.alert-lbl{font-weight:700;font-size:13px;color:var(--red);letter-spacing:2px}
+.srow{display:flex;justify-content:space-between;font-size:11px;padding:3px 0}
+.sk{color:var(--dim)}.sv{color:var(--text);text-align:right}
+.gps-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.gv{font-size:15px;font-weight:bold;color:var(--green)}.gk{font-size:10px;color:var(--dim);letter-spacing:1px}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}.rdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--red);animation:blink 1.2s infinite;margin-right:4px}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:var(--border)}
 </style>
 </head>
 <body>
-
-<div class="header">
-  <div class="header-title">PI<span>CAM</span> 360</div>
-  <div class="header-status">
-    <div><span class="dot" id="dot-f"></span>FRONT</div>
-    <div><span class="dot" id="dot-r"></span>REAR</div>
-    <div><span class="dot" id="dot-cloud"></span>CLOUD</div>
-    <div style="color:var(--cyan)" id="hdr-time"></div>
-  </div>
-</div>
-
-<div class="view-bar">
-  <button class="vbtn active" id="vbtn-360"   onclick="setView('360')">◈ 360 VIEW</button>
-  <button class="vbtn"        id="vbtn-front"  onclick="setView('front')">◀ FRONT</button>
-  <button class="vbtn"        id="vbtn-rear"   onclick="setView('rear')">REAR ▶</button>
-  <button class="vbtn"        id="vbtn-split"  onclick="setView('split')">⊞ SPLIT</button>
-</div>
-
-<div class="stream-wrapper" id="stream-wrapper">
-  <div id="view-360" style="width:100%;max-width:1280px">
-    <img class="stream-combined" id="stream-360" src="/stream">
-    <span class="cam-label cam-label-front">◀ FRONT</span>
-    <span class="cam-label cam-label-rear">REAR ▶</span>
-  </div>
-  <img class="stream-single" id="view-front" src="/stream/front" style="display:none">
-  <img class="stream-single" id="view-rear"  src="/stream/rear"  style="display:none">
-  <div class="stream-split" id="view-split" style="display:none">
-    <img id="split-front" src="/stream/front" style="width:50%">
-    <div class="split-divider"></div>
-    <img id="split-rear"  src="/stream/rear"  style="width:50%">
-  </div>
-</div>
-<div id="reconnect-msg"></div>
-
-<div class="bottom-grid">
-
-  <div class="panel">
-    <div class="panel-title"><span class="rec-dot"></span>Controls</div>
-    <div class="ctrl-row" style="margin-bottom:8px">
-      <button class="btn" id="btn-color" onclick="toggleColor()">Color Detect</button>
-      <button class="btn" id="btn-ml"    onclick="toggleML()">ML Detect</button>
-    </div>
-    <div class="ctrl-row">
-      <button class="btn" id="btn-mode-c" onclick="setMode('center')" style="font-size:11px">Center</button>
-      <button class="btn" id="btn-mode-g" onclick="setMode('grid')"   style="font-size:11px">Grid</button>
-      <button class="btn" onclick="window.open('/snapshot.jpg','_blank')" style="font-size:11px">Snapshot</button>
-    </div>
-    <div style="margin-top:12px;font-size:10px;color:var(--dim);border-top:1px solid var(--border);padding-top:8px">
-      Confirm threshold: <span style="color:var(--yellow)" id="lbl-threshold">3s</span><br>
-      Cooldown after alert: <span style="color:var(--yellow)">10s</span><br>
-      Resolution: <span style="color:var(--cyan)">640×480 per cam</span><br>
-      Quality: <span style="color:var(--cyan)">JPEG 90/92 · Sharp 2.0</span>
-    </div>
-  </div>
-
-  <div class="panel" style="grid-column:span 2">
-    <div class="panel-title">⚠ Accident Detection</div>
-    <div id="ml-panel">
-      <div class="ml-none">ML Detection: OFF — enable to begin monitoring</div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="panel-title">◉ Camera Status</div>
-    <div class="stat-row"><span class="stat-key">FRONT</span><span class="stat-val" id="stat-front">—</span></div>
-    <div class="stat-row"><span class="stat-key">REAR</span> <span class="stat-val" id="stat-rear">—</span></div>
-    <div class="stat-row" style="margin-top:4px">
-      <span class="stat-key">CLOUD</span><span class="stat-val" id="stat-cloud">—</span></div>
-  </div>
-
-  <div class="panel" style="grid-column:span 2">
-    <div class="panel-title">◎ GPS Location</div>
-    <div class="gps-grid">
-      <div><div class="gps-key">LATITUDE</div><div class="gps-val" id="gps-lat">—</div></div>
-      <div><div class="gps-key">LONGITUDE</div><div class="gps-val" id="gps-lon">—</div></div>
-      <div><div class="gps-key">SPEED</div><div class="gps-val" id="gps-spd">—</div></div>
-      <div><div class="gps-key">FIX</div><div class="gps-val" id="gps-fix" style="color:var(--dim)">NO FIX</div></div>
-    </div>
-    <div id="map"></div>
-    <a id="maplink" href="#" target="_blank">📌 Open in Google Maps</a>
-  </div>
-
-  <div class="panel">
-    <div class="panel-title">◐ Color Readings</div>
-    <div id="color-panel" style="color:var(--dim);font-size:11px">Color detection: OFF</div>
-  </div>
-
-</div>
-
-<div id="crash-modal" style="display:none;position:fixed;inset:0;z-index:9999;
-  background:rgba(0,0,0,.75);align-items:center;justify-content:center">
-  <div style="background:#0d0608;border:2px solid var(--red);max-width:460px;width:90%;
-              padding:28px 30px;box-shadow:0 0 40px rgba(255,23,68,.5)">
-    <div style="font-family:'Rajdhani',sans-serif;font-weight:700;font-size:26px;
-                color:var(--red);letter-spacing:4px;margin-bottom:6px">🚨 CRASH CONFIRMED</div>
-    <div style="font-size:13px;color:#ffb3b3;margin-bottom:18px" id="modal-detail">—</div>
-    <div style="font-size:11px;color:var(--dim);margin-bottom:18px">
-      Detection persisted for ≥ <span style="color:var(--yellow)" id="modal-secs">3</span>s
-      — classified as a <strong style="color:var(--red)">real event</strong>.
-    </div>
-    <div style="display:flex;gap:10px">
-      <button onclick="dismissModal(false)"
-        style="flex:1;padding:10px;font-family:'Rajdhani',sans-serif;font-weight:700;
-               font-size:14px;letter-spacing:2px;border:1px solid var(--dim);
-               background:transparent;color:var(--dim);cursor:pointer">DISMISS</button>
-      <button onclick="dismissModal(true)"
-        style="flex:2;padding:10px;font-family:'Rajdhani',sans-serif;font-weight:700;
-               font-size:14px;letter-spacing:2px;border:1px solid var(--red);
-               background:rgba(255,23,68,.15);color:var(--red);cursor:pointer">
-        ACKNOWLEDGE &amp; REPORT</button>
-    </div>
-  </div>
-</div>
-
-<script>
-let colorOn=false, mlOn=false, curMode='center';
-let mlInterval=null, curView='360', streamRetries={};
-let map=null, marker=null;
-let modalShownFor={0:false,1:false};
-let confirmSecs=3;
-
-function updateTime(){
-  document.getElementById('hdr-time').innerText=new Date().toTimeString().slice(0,8);
-}
-setInterval(updateTime,1000); updateTime();
-
-function setView(v){
-  curView=v;
-  ['360','front','rear','split'].forEach(x=>{
-    const el=document.getElementById('view-'+x);
-    if(el) el.style.display=x===v?(x==='split'?'flex':'block'):'none';
-    document.getElementById('vbtn-'+x).classList.toggle('active',x===v);
-  });
-}
-
-function watchStream(el,src){
-  el.onerror=function(){
-    let r=(streamRetries[src]||0)+1; streamRetries[src]=r;
-    const d=Math.min(10000,r*1500);
-    document.getElementById('reconnect-msg').innerText=
-      'Stream lost. Reconnect in '+(d/1000).toFixed(1)+'s...';
-    setTimeout(()=>{el.src=src+'?t='+Date.now();
-      document.getElementById('reconnect-msg').innerText='';},d);
-  };
-  el.onload=()=>{streamRetries[src]=0;document.getElementById('reconnect-msg').innerText='';};
-}
-['stream-360','view-front','view-rear','split-front','split-rear'].forEach(id=>{
-  const el=document.getElementById(id);
-  if(el) watchStream(el, el.getAttribute('src').split('?')[0]);
-});
-
-function toggleColor(){
-  colorOn=!colorOn;
-  fetch('/detection',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({enabled:colorOn,mode:curMode})});
-  document.getElementById('btn-color').className='btn'+(colorOn?' active-cyan':'');
-  if(!colorOn) document.getElementById('color-panel').innerHTML=
-    '<span style="color:var(--dim)">Color detection: OFF</span>';
-}
-function toggleML(){
-  mlOn=!mlOn;
-  fetch('/ml',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({enabled:mlOn})});
-  document.getElementById('btn-ml').className='btn'+(mlOn?' active-orange':'');
-  if(!mlOn){
-    clearInterval(mlInterval);
-    document.getElementById('ml-panel').innerHTML=
-      '<div class="ml-none">ML Detection: OFF — enable to begin monitoring</div>';
-    modalShownFor={0:false,1:false};
-  } else { mlInterval=setInterval(updateML,300); }
-}
-function setMode(m){
-  curMode=m;
-  if(colorOn) fetch('/detection',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({enabled:true,mode:m})});
-  document.getElementById('btn-mode-c').className='btn'+(m==='center'?' active-cyan':'');
-  document.getElementById('btn-mode-g').className='btn'+(m==='grid'?' active-cyan':'');
-}
-
-function showModal(camLabel, boxes, secs){
-  const best=boxes.reduce((a,b)=>a.conf>b.conf?a:b, boxes[0]);
-  document.getElementById('modal-detail').innerText=
-    'Camera: '+camLabel+' | Side: '+best.side+' | Confidence: '+(best.conf*100).toFixed(1)+'%';
-  document.getElementById('modal-secs').innerText=secs.toFixed(1);
-  document.getElementById('crash-modal').style.display='flex';
-  try{ const a=new AudioContext(); const o=a.createOscillator();
-    o.connect(a.destination); o.frequency.value=880;
-    o.start(); setTimeout(()=>o.stop(),300); }catch(e){}
-}
-function dismissModal(report){
-  document.getElementById('crash-modal').style.display='none';
-  if(report) console.log('Reported crash to operator');
-}
-
-function updateML(){
-  fetch('/ml_results').then(r=>r.json()).then(data=>{
-    confirmSecs = (data.front?.confirm_secs || data.rear?.confirm_secs || 3);
-    document.getElementById('lbl-threshold').innerText = confirmSecs+'s';
-    let html='';
-    ['front','rear'].forEach(key=>{
-      const d=data[key], idx=key==='front'?0:1;
-      const label=key==='front'?'FRONT':'REAR';
-      const hdrCls=key==='front'?'ml-cam-front-h':'ml-cam-rear-h';
-      html+=`<div class="ml-cam-section"><span class="ml-cam-header ${hdrCls}">${label} CAM</span>`;
-      if(!d||(!d.first_seen&&!d.confirmed)){
-        html+='<div class="ml-none" style="margin:4px 0 8px 0">No detections</div>';
-      } else if(d.confirmed){
-        html+=`<div class="alert-confirmed"><div class="alert-title">🚨 CRASH CONFIRMED</div>
-          <div class="alert-detail">`;
-        if(d.boxes&&d.boxes.length){
-          const best=d.boxes.reduce((a,b)=>a.conf>b.conf?a:b,d.boxes[0]);
-          html+=`Side: ${best.side} &nbsp;|&nbsp; Conf: ${(best.conf*100).toFixed(1)}%`;
-        }
-        html+=`</div></div>`;
-        if(!modalShownFor[idx]&&d.boxes&&d.boxes.length){
-          modalShownFor[idx]=true;
-          showModal(label,d.boxes,d.elapsed);
-        }
-      } else if(d.first_seen){
-        const pct=Math.min(1,d.elapsed/confirmSecs);
-        const pctPx=(pct*100).toFixed(1);
-        const r=Math.round(255*pct), g=Math.round(255*(1-pct));
-        html+=`<div style="font-size:11px;color:var(--yellow);margin:4px 0">
-          ⏱ VERIFYING — ${d.elapsed.toFixed(1)}s / ${confirmSecs}s</div>
-          <div class="confirm-bar-wrap">
-            <div class="confirm-bar-fill" style="width:${pctPx}%;background:rgb(${r},${g},0)"></div>
-          </div>
-          <div class="confirm-bar-label">Holding for ${confirmSecs}s to confirm real crash…</div>`;
-        if(d.boxes&&d.boxes.length){
-          const best=d.boxes.reduce((a,b)=>a.conf>b.conf?a:b,d.boxes[0]);
-          html+=`<div style="font-size:11px;color:var(--dim);margin-top:4px">
-            ${best.label} · ${best.side} · ${(best.conf*100).toFixed(1)}%</div>`;
-        }
-        modalShownFor[idx]=false;
-      } else { modalShownFor[idx]=false; }
-      html+='</div>';
-    });
-    document.getElementById('ml-panel').innerHTML=html;
-  }).catch(()=>{});
-}
-
-function updateStatus(){
-  fetch('/status').then(r=>r.json()).then(d=>{
-    function el(id,txt){
-      const e=document.getElementById(id); e.innerText=txt;
-      e.className='stat-val'+(
-        txt.includes('Streaming')||txt.includes('Running')?' ok':
-        txt.includes('ERROR')||txt.includes('error')?' err':'');
-    }
-    el('stat-front',d.front||'—'); el('stat-rear',d.rear||'—');
-    document.getElementById('dot-f').className='dot'+
-      (d.front&&d.front.includes('Streaming')?' live':' warn');
-    document.getElementById('dot-r').className='dot'+
-      (d.rear&&d.rear.includes('Streaming')?' live':' warn');
-    document.getElementById('stat-cloud').innerText='ENABLED → Render';
-    document.getElementById('dot-cloud').className='dot live';
-  }).catch(()=>{});
-}
-setInterval(updateStatus,2000); updateStatus();
-
-function updateGPS(){
-  fetch('/gps').then(r=>r.json()).then(d=>{
-    if(d.lat&&d.lon){
-      document.getElementById('gps-lat').innerText=d.lat.toFixed(6)+'°';
-      document.getElementById('gps-lon').innerText=d.lon.toFixed(6)+'°';
-      document.getElementById('gps-spd').innerText=d.speed!=null?d.speed.toFixed(1)+' km/h':'—';
-      document.getElementById('gps-fix').innerText='ACTIVE';
-      document.getElementById('gps-fix').style.color='var(--green)';
-      const ml=document.getElementById('maplink');
-      ml.style.display='block'; ml.href='https://maps.google.com/?q='+d.lat+','+d.lon;
-      if(!map){
-        map=L.map('map').setView([d.lat,d.lon],16);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-          {attribution:'© OSM'}).addTo(map);
-        marker=L.marker([d.lat,d.lon]).addTo(map)
-          .bindPopup('<b>Pi Camera</b><br>'+d.lat.toFixed(5)+', '+d.lon.toFixed(5))
-          .openPopup();
-      } else { marker.setLatLng([d.lat,d.lon]); map.setView([d.lat,d.lon]); }
-    }
-  }).catch(()=>{});
-}
-setInterval(updateGPS,3000); updateGPS();
-
-function updateColors(){
-  fetch('/colors').then(r=>r.json()).then(d=>{
-    const all=[...(d.front||[]).map(x=>({...x,cam:'FRONT'})),
-               ...(d.rear||[]).map(x=>({...x,cam:'REAR'}))];
-    if(!all.length){
-      document.getElementById('color-panel').innerHTML='<span style="color:var(--dim)">No readings</span>';
-      return;
-    }
-    document.getElementById('color-panel').innerHTML=all.map(c=>`
-      <div style="display:flex;align-items:center;gap:8px;margin:3px 0">
-        <div style="width:16px;height:16px;background:${c.hex};border:1px solid #333;flex-shrink:0"></div>
-        <span style="color:var(--dim);font-size:10px">${c.cam}</span>
-        <span>${c.name}</span>
-        <span style="color:var(--dim);font-size:10px">${c.hex}</span>
-      </div>`).join('');
-  }).catch(()=>{});
-}
-
-document.getElementById('btn-mode-c').className='btn active-cyan';
+<div class="header"><div class="logo">PI<span>CAM</span> 360</div><div class="hdr-right"><div><span class="dot" id="df"></span>FRONT</div><div><span class="dot" id="dr"></span>REAR</div><div style="color:var(--cyan)" id="clk"></div></div></div>
+<div class="view-bar"><button class="vbtn active" id="vb360" onclick="sv('360')">◈ 360°</button><button class="vbtn" id="vbfr" onclick="sv('front')">◀ FRONT</button><button class="vbtn" id="vbre" onclick="sv('rear')">REAR ▶</button><button class="vbtn" id="vbsp" onclick="sv('split')">⊞ SPLIT</button></div>
+<div id="crash-banner"><div><span class="crash-info">🚨 CRASH DETECTED — </span><span style="color:var(--dim);font-size:11px">Uploading + email sends in <span class="crash-secs" id="csecs">10s</span></span></div><button class="cancel-btn" onclick="doCancel()">✕ FALSE ALARM — CANCEL</button></div>
+<div class="stream-wrapper" id="sw"><div id="v360" style="position:relative;display:flex;justify-content:center;width:100%"><img class="stream-360" id="s360" src="/stream"><span class="cam-lbl cam-lbl-f">◀ FRONT</span><span class="cam-lbl cam-lbl-r">REAR ▶</span></div><div id="vfr" style="display:none;width:100%"><img class="stream-single" id="sfr" src="/stream/front"></div><div id="vre" style="display:none"><img class="stream-single" id="sre" src="/stream/rear"></div><div class="stream-split" id="vsp" style="display:none"><img id="spf" src="/stream/front"><div class="split-div"></div><img id="spr" src="/stream/rear"></div></div>
+<div class="grid"><div class="panel"><div class="ptitle"><span class="rdot"></span>Controls</div><div class="ctrl-row"><button class="btn" id="bml" onclick="toggleML()">ML Detect</button></div><div style="margin-top:8px;font-size:10px;color:var(--dim);border-top:1px solid var(--border);padding-top:6px">Resolution: <span style="color:var(--cyan)">640×480</span><br>Combined: <span style="color:var(--cyan)">1280×480</span><br>FPS: <span style="color:var(--cyan)">30</span></div></div>
+<div class="panel" style="grid-column:span 2"><div class="ptitle">⚠ Accident Detection</div><div id="mlp" style="font-size:11px;color:var(--dim)">ML Detection: OFF</div></div>
+<div class="panel"><div class="ptitle">◉ Camera Status</div><div class="srow"><span class="sk">FRONT</span><span class="sv" id="stf">—</span></div><div class="srow"><span class="sk">REAR</span> <span class="sv" id="str">—</span></div></div>
+<div class="panel" style="grid-column:span 2"><div class="ptitle">◎ GPS Location</div><div class="gps-grid"><div><div class="gk">LAT</div><div class="gv" id="glat">—</div></div><div><div class="gk">LON</div><div class="gv" id="glon">—</div></div><div><div class="gk">SPEED</div><div class="gv" id="gspd">—</div></div><div><div class="gk">FIX</div><div class="gv" id="gfix" style="color:var(--dim)">NO FIX</div></div></div></div>
+<div class="panel"><div class="ptitle">☁ Firebase</div><div class="srow"><span class="sk">DEVICE ID</span><span class="sv" id="did" style="font-size:9px">—</span></div><div class="srow"><span class="sk">OWNER</span><span class="sv" id="dem" style="font-size:9px">—</span></div><div class="srow"><span class="sk">EMAIL QUEUE</span><span class="sv" id="eq" style="font-size:9px">—</span></div></div></div>
+<script>let mlOn=false,crashActive=false;async function toggleML(){mlOn=!mlOn;await fetch('/ml',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:mlOn})});document.getElementById('bml').classList.toggle('on-org',mlOn);if(mlOn)setInterval(pollML,500);else document.getElementById('mlp').innerHTML='<span style="color:var(--dim)">ML Detection: OFF</span>';}async function pollML(){if(!mlOn)return;try{const d=await(await fetch('/ml_results')).json();let h='';['front','rear'].forEach(k=>{const v=d[k];const lbl=k==='front'?'FRONT':'REAR';const cls=k==='front'?'ml-hdr-f':'ml-hdr-r';h+=`<div class="ml-sec"><span class="ml-hdr ${cls}">${lbl}</span>`;if(!v||(!v.first_seen&&!v.confirmed))h+='<div style="font-size:10px;color:var(--dim);margin:3px 0">No detections</div>';else if(v.confirmed)h+='<div class="alert-box"><div class="alert-lbl">🚨 CRASH CONFIRMED</div></div>';else if(v.first_seen){const p=Math.min(1,v.elapsed/v.confirm_secs);h+=`<div style="font-size:10px;color:var(--yellow)">⏱ ${v.elapsed.toFixed(1)}/${v.confirm_secs}s</div><div class="bar-wrap"><div class="bar-fill" style="width:${p*100}%;background:rgb(${Math.round(255*p)},${Math.round(255*(1-p))},0)"></div></div>`;}h+='</div>';});document.getElementById('mlp').innerHTML=h;}catch(e){}}async function pollCrash(){try{const d=await(await fetch('/crash_alert')).json();const banner=document.getElementById('crash-banner');if(d.active){banner.style.display='flex';document.getElementById('csecs').innerText=Math.ceil(d.seconds_left)+'s';crashActive=true;}else if(crashActive){banner.style.display='none';crashActive=false;}}catch(e){}}async function doCancel(){try{const res=await fetch('/crash_cancel',{method:'POST'});const d=await res.json();if(d.success){crashActive=false;document.getElementById('crash-banner').style.display='none';}}catch(e){alert('Could not cancel — check Pi connection');}}async function pollStatus(){try{const d=await(await fetch('/status')).json();document.getElementById('stf').innerText=d.front||'—';document.getElementById('str').innerText=d.rear||'—';document.getElementById('df').className='dot'+(d.front&&d.front.includes('Streaming')?'live':' warn');document.getElementById('dr').className='dot'+(d.rear&&d.rear.includes('Streaming')?'live':' warn');}catch(e){}}async function pollGPS(){try{const d=await(await fetch('/gps')).json();if(d.lat&&d.lon){document.getElementById('glat').innerText=d.lat.toFixed(5)+'°';document.getElementById('glon').innerText=d.lon.toFixed(5)+'°';document.getElementById('gspd').innerText=d.speed?d.speed.toFixed(1)+' km/h':'—';document.getElementById('gfix').innerText='ACTIVE';document.getElementById('gfix').style.color='var(--green)';};}catch(e){}}async function pollQueue(){try{const d=await(await fetch('/email_queue_status')).json();const el=document.getElementById('eq');if(d.queued===0)el.innerText='None pending';else el.innerText=d.queued+' pending '+(d.internet?'(sending…)':'(offline, waiting)');}catch(e){}}async function loadInfo(){try{const d=await(await fetch('/device/info')).json();document.getElementById('did').innerText=d.device_id||'—';document.getElementById('dem').innerText=d.owner_email||'—';}catch(e){}}function sv(v){const ids={360:'v360',front:'vfr',rear:'vre',split:'vsp'};const btns={360:'vb360',front:'vbfr',rear:'vbre',split:'vbsp'};Object.keys(ids).forEach(x=>{const el=document.getElementById(ids[x]);el.style.display=x===v?(x==='split'?'flex':'block'):'none';document.getElementById(btns[x]).classList.toggle('active',x===v);});}function watchStreams(){[{id:'s360',src:'/stream'},{id:'sfr',src:'/stream/front'},{id:'sre',src:'/stream/rear'},{id:'spf',src:'/stream/front'},{id:'spr',src:'/stream/rear'}].forEach(s=>{const el=document.getElementById(s.id);if(!el)return;el.onerror=()=>setTimeout(()=>{el.src=s.src+'?t='+Date.now();},3000);});}function tick(){document.getElementById('clk').innerText=new Date().toTimeString().slice(0,8);}loadInfo();watchStreams();setInterval(tick,1000);setInterval(pollStatus,2000);setInterval(pollGPS,3000);setInterval(pollCrash,1000);setInterval(pollQueue,5000);
 </script>
 </body>
 </html>'''
     return render_template_string(html)
 
-# ─────────────────── MAIN ───────────────────────────
 if __name__ == "__main__":
-    print("Loading ML model...")
-    model = YOLO("accident_model_latest.pt")
-    print("Model loaded!")
+    print("="*60)
+    print("  Pi Dual Camera — 640x480 + Firebase Storage + Crash Email")
+    print("="*60)
+    print(f"  Owner: {OWNER_EMAIL}")
+    print(f"  Device ID: {DEVICE_ID}")
+    print(f"  Firebase project: {FIREBASE_PROJECT_ID}")
+    print(f"  Storage bucket:   {FIREBASE_STORAGE_BUCKET}")
+    print(f"  CrashEvents collection: {CRASH_EVENTS_COLLECTION}")
 
-    ports = [5000, 5001, 8000, 8080]
+    print("\nLoading ML model…")
+    model = YOLO("accident_model_latest.pt")
+    print("✓ Model loaded!")
+
+    ports         = [5000, 5001, 8000, 8080]
     selected_port = next((p for p in ports if check_port(p)), None)
     if not selected_port:
-        print("No port available!"); exit(1)
+        print("✗ No port available!"); exit(1)
 
     local_ip = get_local_ip()
     kill_existing_cameras()
 
     for idx in (0, 1):
-        threading.Thread(target=camera_thread, args=(idx,), daemon=True).start()
+        threading.Thread(target=camera_thread,   args=(idx,), daemon=True).start()
 
-    threading.Thread(target=overlay_worker, daemon=True).start()
-    threading.Thread(target=ml_worker,      daemon=True).start()
-    threading.Thread(target=cloud_sender,   daemon=True).start()
-    threading.Thread(target=gps_worker,     daemon=True).start()
+    threading.Thread(target=overlay_worker,      daemon=True).start()
+    threading.Thread(target=ml_worker,           daemon=True).start()
+    threading.Thread(target=gps_worker,          daemon=True).start()
+    threading.Thread(target=ring_buffer_worker,  daemon=True).start()
+    threading.Thread(target=email_sender_worker, daemon=True).start()
 
     cameras[0]["frame_ready"].wait(timeout=15)
     cameras[1]["frame_ready"].wait(timeout=5)
@@ -1036,16 +1314,14 @@ if __name__ == "__main__":
     import logging
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
-    print(f"\n{'='*55}")
-    print(f"  Pi Dual Camera — 360 Style + Crash Confirmation")
-    print(f"  UI:         http://{local_ip}:{selected_port}/")
-    print(f"  Combined:   http://{local_ip}:{selected_port}/stream")
-    print(f"  Front:      http://{local_ip}:{selected_port}/stream/front")
-    print(f"  Rear:       http://{local_ip}:{selected_port}/stream/rear")
-    print(f"  Resolution: {CAM_WIDTH}x{CAM_HEIGHT} per camera")
-    print(f"  Quality:    rpicam=90, PIL=92, Sharpness=2.0")
-    print(f"  Confirm:    {CRASH_CONFIRM_SECONDS}s hold required")
-    print(f"  Cooldown:   {CRASH_COOLDOWN_SECONDS}s after confirmed alert")
-    print(f"{'='*55}\n")
+    print(f"\n{'='*60}")
+    print(f"  🎥 UI:            http://{local_ip}:{selected_port}/")
+    print(f"  📡 Stream:        http://{local_ip}:{selected_port}/stream")
+    print(f"  🚨 Crash alert:   http://{local_ip}:{selected_port}/crash_alert")
+    print(f"  ✋  Cancel:        http://{local_ip}:{selected_port}/crash_cancel [POST]")
+    print(f"  ☁  Firebase:      crashes/{{session_id}}/  in Storage")
+    print(f"  📋 Firestore:     {CRASH_EVENTS_COLLECTION}/{{session_id}}")
+    print(f"  📧 SMTP backup:   {SMTP_USER} via {SMTP_HOST}:{SMTP_PORT}")
+    print(f"{'='*60}\n")
 
     app.run(host='0.0.0.0', port=selected_port, threaded=True)
