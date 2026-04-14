@@ -65,94 +65,25 @@ HEARTBEAT_CHECK_INTERVAL = 2    # seconds between dead-device checks
 # ═════════════════════════════════════════════════════
 
 def get_emergency_contact(rider_email: str) -> str | None:
-    """
-    Query TrustedContact where contactEmail == rider_email AND status == 'accepted'.
-    Returns the 'email' field value (the trusted contact's email address).
-    """
-    print(f"[CONTACT] Querying TrustedContact for rider_email='{rider_email}'")
-
-    if not rider_email:
-        print("[CONTACT] ⚠️  rider_email is empty — aborting lookup")
-        return None
-
+    print(f"[CONTACT] Querying for rider_email='{rider_email}'")
     try:
-        firebase_api_key    = os.getenv('FIREBASE_API_KEY',    'AIzaSyDllJ3djkebxHZxHlcp6w54goiDMsXiaS8')
-        firebase_project_id = os.getenv('FIREBASE_PROJECT_ID', 'motospherebsit3b')
-
-        url = (
-            f"https://firestore.googleapis.com/v1/projects/{firebase_project_id}"
-            f"/databases/(default)/documents:runQuery"
-            f"?key={firebase_api_key}"
-        )
-
-        body = {
-            "structuredQuery": {
-                "from": [{"collectionId": "TrustedContact"}],
-                "where": {
-                    "compositeFilter": {
-                        "op": "AND",
-                        "filters": [
-                            {
-                                "fieldFilter": {
-                                    "field":  {"fieldPath": "contactEmail"},
-                                    "op":     "EQUAL",
-                                    "value":  {"stringValue": rider_email}
-                                }
-                            },
-                            {
-                                "fieldFilter": {
-                                    "field": {"fieldPath": "status"},
-                                    "op":    "EQUAL",
-                                    "value": {"stringValue": "accepted"}
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        }
-
-        r = requests.post(url, json=body, timeout=8)
-        print(f"[CONTACT] Firestore HTTP {r.status_code}")
-
-        if r.status_code != 200:
-            print(f"[CONTACT] ❌ Firestore error: {r.text[:300]}")
-            return None
-
-        results = r.json()
-        print(f"[CONTACT] Got {len(results)} result block(s)")
-
-        for i, item in enumerate(results):
-            print(f"[CONTACT] Block[{i}] keys: {list(item.keys())}")
-            if "document" not in item:
-                print(f"[CONTACT] Block[{i}] — no 'document' key (empty result)")
-                continue
-
-            fields = item["document"].get("fields", {})
-            print(f"[CONTACT] Document field names: {list(fields.keys())}")
-            print(f"[CONTACT] Full fields: {json.dumps(fields, indent=2)}")
-
-            contact_email_raw = fields.get("contactEmail", {}).get("stringValue", "")
-            status_raw        = fields.get("status",       {}).get("stringValue", "")
-            email_raw         = fields.get("email",        {}).get("stringValue", "")
-
-            print(f"[CONTACT]   contactEmail = '{contact_email_raw}'")
-            print(f"[CONTACT]   status       = '{status_raw}'")
-            print(f"[CONTACT]   email        = '{email_raw}'")
-
-            if email_raw:
-                print(f"[CONTACT] ✅ Emergency contact resolved: '{email_raw}'")
-                return email_raw
-            else:
-                print(f"[CONTACT] ⚠️  'email' field is empty in this document")
-
-        print(f"[CONTACT] ❌ No usable TrustedContact found for '{rider_email}'")
-
+        docs = db.collection('TrustedContact')\
+                 .where('contactEmail', '==', rider_email)\
+                 .where('status', '==', 'accepted')\
+                 .stream()
+        
+        for doc in docs:
+            data = doc.to_dict()
+            print(f"[CONTACT] Found doc: {data}")
+            email = data.get('email')
+            if email:
+                print(f"[CONTACT] ✅ Emergency contact: {email}")
+                return email
+        
+        print(f"[CONTACT] ❌ No document found")
     except Exception as e:
-        print(f"[CONTACT] ❌ Exception during lookup: {e}")
-
+        print(f"[CONTACT] ❌ Exception: {e}")
     return None
-
 
 def send_email(to: str, subject: str, body: str,
                snapshot_url: str | None = None,
