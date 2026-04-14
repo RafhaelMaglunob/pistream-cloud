@@ -40,7 +40,7 @@ OWNER_EMAIL = "rafhaelmaglunob02@gmail.com"
 # ─────────────────── FIREBASE CONFIG ────────────────
 FIREBASE_PROJECT_ID  = "motospherebsit3b"
 FIREBASE_API_KEY     = "AIzaSyDllJ3djkebxHZxHlcp6w54goiDMsXiaS8"
-FIREBASE_STORAGE_BUCKET = "motospherebsit3b.firebasestorage.app"
+FIREBASE_STORAGE_BUCKET = "motospherebsit3b.appspot.com"
 
 RIDERS_COLLECTION      = "Riders"
 CRASH_EVENTS_COLLECTION = "CrashEvents"
@@ -1234,6 +1234,35 @@ def index():
     return render_template_string(html)
 
 if __name__ == "__main__":
+	# ─── STARTUP TEST ───
+    print("\n[TEST] Checking Firebase connection...")
+    test_contact = get_emergency_contact(OWNER_EMAIL)
+    if test_contact:
+        print(f"[TEST] ✅ Emergency contact found: {test_contact}")
+    else:
+        print(f"[TEST] ❌ No emergency contact found for {OWNER_EMAIL}")
+        print(f"[TEST]    Check Firestore: TrustedContact collection")
+        print(f"[TEST]    Must have: contactEmail == '{OWNER_EMAIL}' AND status == 'accepted'")
+
+    print(f"\n[TEST] Checking internet...")
+    if has_internet():
+        print(f"[TEST] ✅ Internet OK")
+    else:
+        print(f"[TEST] ❌ No internet — emails will queue until online")
+
+    print(f"\n[TEST] Checking SMTP credentials...")
+    try:
+        import smtplib
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+        print(f"[TEST] ✅ SMTP login OK — can send emails")
+    except Exception as e:
+        print(f"[TEST] ❌ SMTP failed: {e}")
+
+    print("\n" + "="*60)
+    
     print("="*60)
     print("  Pi Dual Camera — 640x480 + Firebase Storage + Crash Email")
     print("="*60)
