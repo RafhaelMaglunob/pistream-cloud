@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Pi Dual CSI Camera — HD 360° + Crash Recording + Relay Upload
-FIXED VERSION:
-  - RELAY_URL must match your actual Render service URL
-  - Crash pipeline: sends to Relay FIRST, then Pi starts heartbeating
-    (Relay's 10s cancel window runs in parallel with Pi sending heartbeats)
-  - Heartbeat thread starts BEFORE the cancel window expires
-  - Pi no longer waits locally — Relay owns the cancel window
-  - Local cancel window on Pi now just signals Relay to cancel
+Pi Dual CSI Camera — HD 360° + Crash Recording + Pi-side Email + Firebase Upload
+- 10s pre/post ring buffer recording
+- ffmpeg MP4 compilation
+- 10s cancel window (phone polls /crash_alert, calls /crash_cancel)
+- Pi sends email via Gmail SMTP using smtplib (no cloud, no phone)
+- Queues email if offline, retries every 15s until internet returns
+- Emergency contact fetched from Firebase Firestore per rider
+- Uploads crash video + snapshot to Firebase Storage after cancel window
+- Writes CrashEvents Firestore document (triggers serverless email tomorrow)
+- OWNER_EMAIL hardcoded — change with: nano app.py then restart
 """
 
 from flask import Flask, Response, request, jsonify, render_template_string
 import threading, time, socket, io, subprocess, hashlib
 import collections, os, glob, shutil
 import numpy as np
-import base64
 from PIL import Image, ImageDraw, ImageFont
 import colorsys
 import torch
@@ -32,26 +33,22 @@ app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # ═════════════════════════════════════════════════════
-# !! CHANGE THIS TO YOUR ACTUAL RENDER URL !!
-# Check: Render Dashboard → your service → top of page
-# Example: https://motosphere-relay.onrender.com
-# ═════════════════════════════════════════════════════
-RELAY_URL = "https://pistream-cloud.onrender.com"
-
-# ═════════════════════════════════════════════════════
-# OWNER CONFIG — the rider's email (used to look up their emergency contact)
+# OWNER CONFIG
 # ═════════════════════════════════════════════════════
 OWNER_EMAIL = "rafhaelmaglunob02@gmail.com"
 
 # ─────────────────── FIREBASE CONFIG ────────────────
-FIREBASE_PROJECT_ID     = "motospherebsit3b"
-FIREBASE_API_KEY        = "AIzaSyDllJ3djkebxHZxHlcp6w54goiDMsXiaS8"
+FIREBASE_PROJECT_ID  = "motospherebsit3b"
+FIREBASE_API_KEY     = "AIzaSyDllJ3djkebxHZxHlcp6w54goiDMsXiaS8"
 FIREBASE_STORAGE_BUCKET = "motospherebsit3b.firebasestorage.app"
 
+RIDERS_COLLECTION      = "Riders"
 CRASH_EVENTS_COLLECTION = "CrashEvents"
 
+# ___________________   RENDER    ____________________
+RELAY_URL = "https://pistream-cloud.onrender.com/"
+
 # ─────────────────── SMTP CONFIG ────────────────────
-# Fallback: Pi sends email directly if Relay is unreachable
 SMTP_HOST     = "smtp.gmail.com"
 SMTP_PORT     = 587
 SMTP_USER     = "motosphere.smart@gmail.com"
@@ -74,7 +71,7 @@ COMBINED_H = 480
 CRASH_LABEL            = 'motor_crash'
 CRASH_CONF_THRESHOLD   = 0.90
 CRASH_CONFIRM_SECONDS  = 3
-CRASH_COOLDOWN_SECONDS = 10   # local cancel window shown on Pi UI
+CRASH_COOLDOWN_SECONDS = 10
 
 # ─────────────────── RECORDING CONFIG ───────────────
 RECORD_PRE_SECONDS  = 10
@@ -142,7 +139,6 @@ crash_record_state = {
 _email_queue      = []
 _email_queue_lock = threading.Lock()
 
-
 # ═════════════════════════════════════════════════════
 # UTILS
 # ═════════════════════════════════════════════════════
@@ -165,8 +161,12 @@ def set_cam_status(cam_idx, msg):
 def has_internet() -> bool:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3); s.connect(("8.8.8.8", 53)); s.close(); return True
-    except Exception: return False
+        s.settimeout(3)
+        s.connect(("8.8.8.8", 53))
+        s.close()
+        return True
+    except Exception:
+        return False
 
 def rgb_to_color_name(r, g, b):
     h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
@@ -186,7 +186,6 @@ def rgb_to_color_name(r, g, b):
     elif h < 345: return "Magenta"
     return "Unknown"
 
-
 # ═════════════════════════════════════════════════════
 # AUTH
 # ═════════════════════════════════════════════════════
@@ -197,19 +196,23 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-
 # ═════════════════════════════════════════════════════
-# FIREBASE — EMERGENCY CONTACT
+# FIREBASE — EMERGENCY CONTACT (TRUSTEDCONTACT)
 # ═════════════════════════════════════════════════════
 
 def get_emergency_contact(rider_email: str) -> str | None:
-    """Fetch emergency contact from TrustedContact (used for fallback direct email)."""
+    """
+    Fetch emergency contact from TrustedContact collection.
+    Query: contactEmail == rider_email AND status == 'accepted'
+    Return: email field (the trusted contact's email)
+    """
     try:
         url = (
             f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}"
             f"/databases/(default)/documents:runQuery"
             f"?key={FIREBASE_API_KEY}"
         )
+        
         body = {
             "structuredQuery": {
                 "from": [{"collectionId": "TrustedContact"}],
@@ -217,33 +220,46 @@ def get_emergency_contact(rider_email: str) -> str | None:
                     "compositeFilter": {
                         "op": "AND",
                         "filters": [
-                            {"fieldFilter": {"field": {"fieldPath": "contactEmail"},
-                                             "op": "EQUAL",
-                                             "value": {"stringValue": rider_email}}},
-                            {"fieldFilter": {"field": {"fieldPath": "status"},
-                                             "op": "EQUAL",
-                                             "value": {"stringValue": "accepted"}}},
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "contactEmail"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": rider_email}
+                                }
+                            },
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "status"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": "accepted"}
+                                }
+                            }
                         ]
                     }
                 }
             }
         }
+        
         r = req_lib.post(url, json=body, timeout=6)
+        
         if r.status_code == 200:
-            for item in r.json():
+            results = r.json()
+            for item in results:
                 if "document" in item:
                     fields = item["document"].get("fields", {})
-                    email  = fields.get("email", {}).get("stringValue")
-                    if email:
-                        print(f"[PI-CONTACT] Found: {email}")
-                        return email
+                    contact_email = fields.get("email", {}).get("stringValue")
+                    if contact_email:
+                        print(f"[FIREBASE] Found TrustedContact for {rider_email}: {contact_email}")
+                        return contact_email
+            print(f"[FIREBASE] No accepted TrustedContact found for {rider_email}")
+        else:
+            print(f"[FIREBASE] Query failed ({r.status_code}): {r.text[:200]}")
     except Exception as e:
-        print(f"[PI-CONTACT] Error: {e}")
+        print(f"[FIREBASE] get_emergency_contact error: {e}")
     return None
 
-
 # ═════════════════════════════════════════════════════
-# FIREBASE STORAGE — UPLOAD (fallback direct upload)
+# FIREBASE STORAGE — UPLOAD
 # ═════════════════════════════════════════════════════
 
 def _firebase_storage_upload(local_path: str, remote_path: str,
@@ -257,20 +273,94 @@ def _firebase_storage_upload(local_path: str, remote_path: str,
         )
         with open(local_path, 'rb') as f:
             data = f.read()
+
         r = req_lib.post(url, data=data,
-                         headers={"Content-Type": content_type}, timeout=120)
+                         headers={"Content-Type": content_type},
+                         timeout=120)
+
         if r.status_code in (200, 201):
             token = r.json().get("downloadTokens", "")
-            return (
+            download_url = (
                 f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
                 f"/o/{encoded}?alt=media&token={token}"
             )
-        print(f"[PI-STORAGE] Upload failed ({r.status_code}): {r.text[:200]}")
-        return None
+            print(f"[STORAGE] ✅ Uploaded → {remote_path}")
+            return download_url
+        else:
+            print(f"[STORAGE] ❌ Upload failed ({r.status_code}): {r.text[:200]}")
+            return None
     except Exception as e:
-        print(f"[PI-STORAGE] Error: {e}")
+        print(f"[STORAGE] ❌ Upload error: {e}")
         return None
 
+
+def upload_crash_to_firebase(session_id: str,
+                              snapshot_path: str | None,
+                              video_path: str | None) -> dict:
+    result = {"snapshot_url": None, "video_url": None}
+
+    if snapshot_path and os.path.exists(snapshot_path):
+        remote = f"crashes/{session_id}/snapshot.jpg"
+        result["snapshot_url"] = _firebase_storage_upload(
+            snapshot_path, remote, "image/jpeg")
+
+    if video_path and os.path.exists(video_path):
+        remote = f"crashes/{session_id}/crash_clip.mp4"
+        result["video_url"] = _firebase_storage_upload(
+            video_path, remote, "video/mp4")
+
+    return result
+
+# ═════════════════════════════════════════════════════
+# FIRESTORE — CRASH EVENT DOCUMENT
+# ═════════════════════════════════════════════════════
+
+def write_crash_event(session_id: str,
+                      rider_email: str,
+                      emergency_email: str | None,
+                      cam_label: str,
+                      location_str: str,
+                      speed_str: str,
+                      snapshot_url: str | None,
+                      video_url: str | None) -> bool:
+    try:
+        url = (
+            f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}"
+            f"/databases/(default)/documents/{CRASH_EVENTS_COLLECTION}/{session_id}"
+            f"?key={FIREBASE_API_KEY}"
+        )
+
+        def _str(v):  return {"stringValue": v or ""}
+        def _null():  return {"nullValue": None}
+
+        body = {
+            "fields": {
+                "session_id":      _str(session_id),
+                "device_id":       _str(DEVICE_ID),
+                "rider_email":     _str(rider_email),
+                "emergency_email": _str(emergency_email) if emergency_email else _null(),
+                "cam_label":       _str(cam_label),
+                "location":        _str(location_str),
+                "speed":           _str(speed_str),
+                "time":            _str(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                "snapshot_url":    _str(snapshot_url) if snapshot_url else _null(),
+                "video_url":       _str(video_url)    if video_url    else _null(),
+                "status":          _str("pending"),
+            }
+        }
+
+        r = req_lib.patch(url, json=body, timeout=10)
+
+        if r.status_code in (200, 201):
+            print(f"[FIRESTORE] ✅ CrashEvent written → {session_id}")
+            return True
+        else:
+            print(f"[FIRESTORE] ❌ Write failed ({r.status_code}): {r.text[:200]}")
+            return False
+
+    except Exception as e:
+        print(f"[FIRESTORE] ❌ Error: {e}")
+        return False
 
 # ═════════════════════════════════════════════════════
 # COLOR DETECTION
@@ -279,10 +369,12 @@ def _firebase_storage_upload(local_path: str, remote_path: str,
 def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
     try:
         img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
-        arr = np.array(img); h, w = arr.shape[:2]; colors = []
+        arr = np.array(img)
+        h, w = arr.shape[:2]
+        colors = []
         if mode == 'center':
-            cx, cy = w//2, h//2
-            sample = arr[max(0,cy-40):cy+40, max(0,cx-40):cx+40]
+            cx, cy  = w//2, h//2
+            sample  = arr[max(0,cy-40):cy+40, max(0,cx-40):cx+40]
             r, g, b = sample.mean(axis=(0,1)).astype(int)
             colors.append({'position':'center','rgb':f'rgb({r},{g},{b})',
                 'rgba':f'rgba({r},{g},{b},1)','hex':f'#{r:02x}{g:02x}{b:02x}',
@@ -303,7 +395,6 @@ def detect_colors_in_frame(cam_idx, frame_bytes, mode='center'):
     except Exception as e:
         print(f"Color detection error cam{cam_idx}: {e}")
 
-
 # ═════════════════════════════════════════════════════
 # ML DETECTION + CRASH CONFIRMATION
 # ═════════════════════════════════════════════════════
@@ -314,6 +405,7 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
         results = model.predict(source=np.array(img), imgsz=640, conf=0.5, verbose=False)
         boxes   = []
         w, h    = img.size
+
         for r in results:
             if len(r.boxes) == 0: continue
             for box, conf, cls in zip(r.boxes.xyxy, r.boxes.conf, r.boxes.cls):
@@ -325,6 +417,7 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
                 side = 'Left' if cx < w/3 else ('Center' if cx < w*2/3 else 'Right')
                 boxes.append({'box':[x1,y1,x2,y2],'label':label,
                               'conf':float(conf),'side':side,'cam':cam_idx})
+
         with ml_lock:
             ml_results[cam_idx] = boxes
 
@@ -333,12 +426,13 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
             cs = confirm_state[cam_idx]
             if boxes:
                 if cs["first_seen"] is None:
-                    cs["first_seen"]   = now
-                    cs["elapsed"]      = 0.0
-                    cs["confirmed"]    = False
+                    cs["first_seen"] = now
+                    cs["elapsed"]    = 0.0
+                    cs["confirmed"]  = False
                     cs["confirmed_at"] = None
                 cs["boxes"]   = boxes
                 cs["elapsed"] = now - cs["first_seen"]
+
                 if (not cs["confirmed"]
                         and cs["elapsed"] >= CRASH_CONFIRM_SECONDS
                         and now >= cs["cooldown_until"]):
@@ -359,22 +453,11 @@ def detect_accidents_in_frame(cam_idx, frame_bytes):
     except Exception as e:
         print(f"ML detection error cam{cam_idx}: {e}")
 
-
 # ═════════════════════════════════════════════════════
-# CRASH PIPELINE  ← MAIN FIX IS HERE
+# CRASH PIPELINE
 # ═════════════════════════════════════════════════════
 
 def crash_pipeline(cam_idx: int, confirmed_at: float):
-    """
-    FIXED FLOW:
-      1. Record pre+post frames
-      2. Compile video
-      3. Send to Relay IMMEDIATELY (Relay starts its 10s cancel window)
-      4. Pi starts sending heartbeats to Relay (proves Pi is alive)
-      5. Pi shows cancel UI for 10s
-      6. If user cancels on Pi UI → tell Relay to cancel
-      7. If no cancel → Relay sends email automatically after its window
-    """
     session_id  = f"crash_{int(confirmed_at)}_cam{cam_idx}"
     session_dir = os.path.join(RECORD_DIR, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -391,9 +474,8 @@ def crash_pipeline(cam_idx: int, confirmed_at: float):
             "seconds_left": float(CRASH_COOLDOWN_SECONDS),
         })
 
-    print(f"[CRASH] ═══ Pipeline started: {session_id} ═══")
+    print(f"[CRASH] Pipeline → {session_id}")
 
-    # ── PHASE 1: Pre-crash frames from ring buffer ─────────────────────────
     with ring_buffer_lock:
         pre_frames = list(ring_buffer)
 
@@ -405,13 +487,12 @@ def crash_pipeline(cam_idx: int, confirmed_at: float):
         pre_paths.append(path)
     print(f"[CRASH] Saved {len(pre_paths)} pre-crash frames")
 
-    # ── PHASE 2: Post-crash frames (10s) ──────────────────────────────────
     post_paths     = []
     frame_idx      = len(pre_paths)
     deadline       = time.time() + RECORD_POST_SECONDS
     frame_interval = 1.0 / RECORD_FPS
 
-    while time.time() < deadline:
+    while time.time() < deadline and not cancel_event.is_set():
         with combined_frame_lock:
             frame = combined_frame
         if frame:
@@ -423,12 +504,27 @@ def crash_pipeline(cam_idx: int, confirmed_at: float):
         time.sleep(frame_interval)
     print(f"[CRASH] Saved {len(post_paths)} post-crash frames")
 
-    # ── PHASE 3: Compile video ─────────────────────────────────────────────
+    cancel_deadline = confirmed_at + CRASH_COOLDOWN_SECONDS
+    while time.time() < cancel_deadline and not cancel_event.is_set():
+        with crash_record_lock:
+            crash_record_state["seconds_left"] = max(0.0, cancel_deadline - time.time())
+        time.sleep(0.25)
+
+    with crash_record_lock:
+        crash_record_state["active"]       = False
+        crash_record_state["seconds_left"] = 0.0
+
+    if cancel_event.is_set():
+        print(f"[CRASH] Cancelled — removing session {session_id}")
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return
+
+    print(f"[CRASH] Cancel window expired — compiling + uploading")
+
     snapshot_path = pre_paths[-1] if pre_paths else (post_paths[0] if post_paths else None)
     video_path    = os.path.join(session_dir, "crash_clip.mp4")
     compiled      = _compile_video(session_dir, video_path)
 
-    # ── PHASE 4: Get GPS ───────────────────────────────────────────────────
     with gps_state_lock:
         lat   = gps_state.get("lat")
         lon   = gps_state.get("lon")
@@ -436,160 +532,66 @@ def crash_pipeline(cam_idx: int, confirmed_at: float):
 
     location_str = f"{lat:.5f}, {lon:.5f}" if lat and lon else "Unknown"
     speed_str    = f"{speed:.1f} km/h"     if speed      else "Unknown"
+    time_str     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cam_label    = "FRONT" if cam_idx == 0 else "REAR"
 
-    # ── PHASE 5: Encode media to base64 ───────────────────────────────────
-    snapshot_b64 = None
-    video_b64    = None
+    firebase_urls = {"snapshot_url": None, "video_url": None}
 
-    if snapshot_path and os.path.exists(snapshot_path):
-        try:
-            with open(snapshot_path, 'rb') as f:
-                snapshot_b64 = base64.b64encode(f.read()).decode('utf-8')
-            print(f"[CRASH] Snapshot encoded ({len(snapshot_b64)//1024} KB)")
-        except Exception as e:
-            print(f"[CRASH] Snapshot encode error: {e}")
-
-    if compiled and os.path.exists(video_path):
-        try:
-            with open(video_path, 'rb') as f:
-                video_b64 = base64.b64encode(f.read()).decode('utf-8')
-            print(f"[CRASH] Video encoded ({len(video_b64)//1024} KB)")
-        except Exception as e:
-            print(f"[CRASH] Video encode error: {e}")
-
-    # ── PHASE 6: Send to Relay IMMEDIATELY ───────────────────────────────
-    # Relay starts its own 10s cancel window RIGHT NOW.
-    # Pi starts heartbeating in parallel.
-    relay_ok = _send_crash_to_relay(
-        session_id   = session_id,
-        device_id    = DEVICE_ID,
-        rider_email  = OWNER_EMAIL,
-        cam_label    = cam_label,
-        location     = location_str,
-        speed        = speed_str,
-        snapshot_b64 = snapshot_b64,
-        video_b64    = video_b64,
-    )
-
-    if not relay_ok:
-        print(f"[CRASH] ⚠️  Relay unreachable — falling back to direct Pi email")
-        _fallback_direct_email(
-            session_id=session_id, cam_label=cam_label,
-            location_str=location_str, speed_str=speed_str,
-            snapshot_path=snapshot_path,
-            video_path=video_path if compiled else None,
+    if has_internet():
+        print(f"[CRASH] Uploading to Firebase Storage…")
+        firebase_urls = upload_crash_to_firebase(
+            session_id    = session_id,
+            snapshot_path = snapshot_path,
+            video_path    = video_path if compiled else None,
         )
-
-    # ── PHASE 7: Heartbeat + local cancel window ───────────────────────────
-    # Start heartbeat thread immediately (tells Relay Pi is alive)
-    cancel_deadline = time.time() + CRASH_COOLDOWN_SECONDS
-    hb_thread = threading.Thread(
-        target=_send_heartbeats,
-        args=(session_id, cancel_deadline, cancel_event),
-        daemon=True
-    )
-    hb_thread.start()
-
-    # Show cancel UI countdown on Pi for CRASH_COOLDOWN_SECONDS
-    while time.time() < cancel_deadline and not cancel_event.is_set():
-        with crash_record_lock:
-            crash_record_state["seconds_left"] = max(0.0, cancel_deadline - time.time())
-        time.sleep(0.25)
-
-    with crash_record_lock:
-        crash_record_state.update({"active": False, "seconds_left": 0.0})
-
-    if cancel_event.is_set():
-        print(f"[CRASH] Cancelled by rider — notifying Relay")
-        # Relay cancel is sent by crash_cancel() route, not here
     else:
-        print(f"[CRASH] Cancel window expired — Relay will send email")
+        print(f"[CRASH] No internet — skipping Firebase upload, Pi email only")
 
-    # ── Cleanup ────────────────────────────────────────────────────────────
-    shutil.rmtree(session_dir, ignore_errors=True)
-    print(f"[CRASH] Local session cleaned up: {session_id}")
-
-
-def _send_heartbeats(session_id: str, deadline: float, cancel_event: threading.Event):
-    """Send heartbeat to Relay every 2s until deadline or cancel."""
-    print(f"[HEARTBEAT] Starting for {session_id}")
-    while time.time() < deadline and not cancel_event.is_set():
-        try:
-            resp = req_lib.post(
-                f"{RELAY_URL}/api/crash/heartbeat",
-                json={"session_id": session_id, "device_id": DEVICE_ID},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                print(f"[HEARTBEAT] ❤️  sent")
-            else:
-                print(f"[HEARTBEAT] ⚠️  {resp.status_code}")
-        except Exception as e:
-            print(f"[HEARTBEAT] ⚠️  {e}")
-        time.sleep(2)
-    print(f"[HEARTBEAT] Stopped for {session_id}")
-
-
-def _send_crash_to_relay(session_id: str, device_id: str, rider_email: str,
-                         cam_label: str, location: str, speed: str,
-                         snapshot_b64: str | None, video_b64: str | None) -> bool:
-    """POST crash data to Relay. Returns True if successful."""
-    print(f"[RELAY] Sending crash to {RELAY_URL}/api/crash/alert")
-    try:
-        payload = {
-            "session_id":      session_id,
-            "device_id":       device_id,
-            "rider_email":     rider_email,
-            "cam_label":       cam_label,
-            "location":        location,
-            "speed":           speed,
-            "snapshot_base64": snapshot_b64,
-            "video_base64":    video_b64,
-        }
-        resp = req_lib.post(
-            f"{RELAY_URL}/api/crash/alert",
-            json=payload,
-            timeout=120
-        )
-        if resp.status_code == 200:
-            result = resp.json()
-            print(f"[RELAY] ✅ {result.get('message')}")
-            print(f"[RELAY]    emergency_email_found = {result.get('emergency_email_found')}")
-            return True
-        else:
-            print(f"[RELAY] ❌ {resp.status_code}: {resp.text[:200]}")
-            return False
-    except Exception as e:
-        print(f"[RELAY] ❌ Exception: {e}")
-        return False
-
-
-def _fallback_direct_email(session_id: str, cam_label: str,
-                           location_str: str, speed_str: str,
-                           snapshot_path: str | None, video_path: str | None):
-    """Send email directly from Pi if Relay is unreachable."""
-    print(f"[FALLBACK] Attempting direct email from Pi")
     emergency_email = get_emergency_contact(OWNER_EMAIL)
-    if not emergency_email:
-        print(f"[FALLBACK] ❌ No emergency contact found for {OWNER_EMAIL}")
-        return
 
-    _enqueue_email(
-        to           = emergency_email,
-        subject      = f"🚨 CRASH ALERT (Pi direct) — [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]",
-        body         = (
-            f"CRASH ALERT — PiCAM 360 (sent directly from Pi)\n\n"
+    if has_internet():
+        write_crash_event(
+            session_id      = session_id,
+            rider_email     = OWNER_EMAIL,
+            emergency_email = emergency_email,
+            cam_label       = cam_label,
+            location_str    = location_str,
+            speed_str       = speed_str,
+            snapshot_url    = firebase_urls["snapshot_url"],
+            video_url       = firebase_urls["video_url"],
+        )
+
+    if emergency_email:
+        subject = f"🚨 CRASH ALERT — PiCAM [{time_str}]"
+        body    = (
+            f"CRASH ALERT — PiCAM 360\n\n"
+            f"Time:     {time_str}\n"
             f"Camera:   {cam_label}\n"
             f"Location: {location_str}\n"
-            f"Speed:    {speed_str}\n"
-            f"Device:   {DEVICE_ID}\n\n"
-            f"Note: Cloud relay was unreachable, email sent directly.\n"
-        ),
-        image_path   = snapshot_path,
-        video_path   = video_path,
-        session_dir  = None,
-    )
+            f"Speed:    {speed_str}\n\n"
+            f"A crash was detected and was NOT cancelled within "
+            f"{CRASH_COOLDOWN_SECONDS} seconds.\n\n"
+        )
+        if firebase_urls["video_url"]:
+            body += f"Video: {firebase_urls['video_url']}\n"
+        if firebase_urls["snapshot_url"]:
+            body += f"Snapshot: {firebase_urls['snapshot_url']}\n"
+        body += (
+            f"\n{'A local 20s video clip and snapshot are also attached.' if compiled else 'A snapshot is attached (video compilation failed).'}\n\n"
+            f"— PiCAM automatic alert system"
+        )
+        _enqueue_email(
+            to          = emergency_email,
+            subject     = subject,
+            body        = body,
+            image_path  = snapshot_path,
+            video_path  = video_path if compiled else None,
+            session_dir = session_dir,
+        )
+    else:
+        print("[EMAIL] No emergency contact found — no fallback email queued")
+        if firebase_urls["video_url"] or firebase_urls["snapshot_url"]:
+            shutil.rmtree(session_dir, ignore_errors=True)
 
 
 def _compile_video(session_dir: str, output_path: str) -> bool:
@@ -600,6 +602,7 @@ def _compile_video(session_dir: str, output_path: str) -> bool:
             for p in all_jpgs:
                 f.write(f"file '{p}'\n")
                 f.write(f"duration {1.0 / RECORD_FPS}\n")
+
         result = subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
             '-i',       list_path,
@@ -610,104 +613,129 @@ def _compile_video(session_dir: str, output_path: str) -> bool:
             '-pix_fmt', 'yuv420p',
             output_path
         ], capture_output=True, timeout=90)
+
         if result.returncode == 0:
-            print(f"[VIDEO] ✅ Compiled: {output_path}")
+            print(f"[VIDEO] Compiled → {output_path}")
             return True
-        print(f"[VIDEO] ❌ ffmpeg error: {result.stderr.decode()[:200]}")
+        print(f"[VIDEO] ffmpeg error: {result.stderr.decode()}")
         return False
     except Exception as e:
-        print(f"[VIDEO] ❌ {e}")
+        print(f"[VIDEO] Compile error: {e}")
         return False
 
-
 # ═════════════════════════════════════════════════════
-# EMAIL QUEUE + SENDER (Pi-side fallback)
+# EMAIL QUEUE + SENDER
 # ═════════════════════════════════════════════════════
 
 def _enqueue_email(to, subject, body, image_path, video_path, session_dir):
     with _email_queue_lock:
         _email_queue.append({
-            "to": to, "subject": subject, "body": body,
-            "image_path": image_path, "video_path": video_path,
-            "session_dir": session_dir, "attempts": 0,
+            "to":          to,
+            "subject":     subject,
+            "body":        body,
+            "image_path":  image_path,
+            "video_path":  video_path,
+            "session_dir": session_dir,
+            "attempts":    0,
         })
-    print(f"[EMAIL-Q] Queued for {to} (total: {len(_email_queue)})")
+    print(f"[EMAIL] Queued → {to}  (total queued: {len(_email_queue)})")
 
 
 def email_sender_worker():
-    print("[EMAIL-Q] Worker started")
+    print("[EMAIL] Sender worker started")
     while True:
         with _email_queue_lock:
             pending = list(_email_queue)
+
         if not pending:
             time.sleep(5); continue
+
         if not has_internet():
-            print(f"[EMAIL-Q] Offline — {len(pending)} queued, waiting")
+            print(f"[EMAIL] No internet — {len(pending)} email(s) queued, waiting…")
             time.sleep(15); continue
+
         sent_indices = []
         for i, item in enumerate(pending):
-            ok = _send_email_direct(item["to"], item["subject"], item["body"],
-                                    item.get("image_path"), item.get("video_path"))
+            ok = _send_email(
+                to         = item["to"],
+                subject    = item["subject"],
+                body       = item["body"],
+                image_path = item.get("image_path"),
+                video_path = item.get("video_path"),
+            )
             if ok:
                 sent_indices.append(i)
-                sd = item.get("session_dir")
-                if sd and os.path.isdir(sd):
-                    shutil.rmtree(sd, ignore_errors=True)
+                session_dir = item.get("session_dir")
+                if session_dir and os.path.isdir(session_dir):
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                    print(f"[EMAIL] Cleaned up session: {session_dir}")
             else:
                 item["attempts"] += 1
+                print(f"[EMAIL] Retry #{item['attempts']} for {item['to']}")
+
         if sent_indices:
             with _email_queue_lock:
                 for i in sorted(sent_indices, reverse=True):
                     if i < len(_email_queue):
                         _email_queue.pop(i)
+
         time.sleep(10)
 
 
-def _send_email_direct(to: str, subject: str, body: str,
-                        image_path: str | None = None,
-                        video_path: str | None = None) -> bool:
+def _send_email(to: str, subject: str, body: str,
+                image_path: str | None = None,
+                video_path: str | None = None) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_USER; msg['To'] = to; msg['Subject'] = subject
+        msg            = MIMEMultipart()
+        msg['From']    = SMTP_USER
+        msg['To']      = to
+        msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
+
         if image_path and os.path.exists(image_path):
             with open(image_path, 'rb') as f:
-                part = MIMEBase('image', 'jpeg'); part.set_payload(f.read())
+                part = MIMEBase('image', 'jpeg')
+                part.set_payload(f.read())
             encoders.encode_base64(part)
             part.add_header('Content-Disposition', 'attachment; filename="crash_snapshot.jpg"')
             msg.attach(part)
+
         if video_path and os.path.exists(video_path):
             with open(video_path, 'rb') as f:
-                part = MIMEBase('video', 'mp4'); part.set_payload(f.read())
+                part = MIMEBase('video', 'mp4')
+                part.set_payload(f.read())
             encoders.encode_base64(part)
             part.add_header('Content-Disposition', 'attachment; filename="crash_clip.mp4"')
             msg.attach(part)
+
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.ehlo(); server.starttls(); server.ehlo()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, to, msg.as_string())
-        print(f"[EMAIL-DIRECT] ✅ Sent to {to}")
+
+        print(f"[EMAIL] ✅ Sent to {to}")
         return True
     except Exception as e:
-        print(f"[EMAIL-DIRECT] ❌ {e}")
+        print(f"[EMAIL] ❌ Failed ({to}): {e}")
         return False
-
 
 # ═════════════════════════════════════════════════════
 # RING BUFFER WORKER
 # ═════════════════════════════════════════════════════
 
 def ring_buffer_worker():
-    interval = 1.0 / RECORD_FPS; last_frame = None
+    interval   = 1.0 / RECORD_FPS
+    last_frame = None
     print("[RING] Buffer worker started")
     while True:
         time.sleep(interval)
-        with combined_frame_lock: frame = combined_frame
-        if frame is None or frame is last_frame: continue
+        with combined_frame_lock:
+            frame = combined_frame
+        if frame is None or frame is last_frame:
+            continue
         last_frame = frame
         with ring_buffer_lock:
             ring_buffer.append((time.time(), frame))
-
 
 # ═════════════════════════════════════════════════════
 # OVERLAY
@@ -722,9 +750,11 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
             sfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
         except Exception:
             font = sfont = ImageFont.load_default()
+
         badge_col = (0, 200, 255, 220) if cam_idx == 0 else (255, 100, 0, 220)
         draw.rectangle([4, 4, 110, 26], fill=badge_col)
         draw.text((8, 6), cameras[cam_idx]["label"], fill=(0,0,0,255), font=font)
+
         with detection_lock:
             colors = detected_colors[cam_idx].copy()
         for color in colors:
@@ -735,38 +765,47 @@ def add_overlay(cam_idx, frame_bytes, mode='center'):
             elif mode == 'grid':
                 draw.ellipse([x-10,y-10,x+10,y+10],
                              fill=(color['r'],color['g'],color['b'],255))
+
         with confirm_lock:
             cs = confirm_state[cam_idx].copy()
         with ml_lock:
             boxes = ml_results[cam_idx].copy()
+
         now = time.time()
         for b in boxes:
             x1,y1,x2,y2 = b['box']
             if cs["confirmed"] and cs["confirmed_at"] and \
                now - cs["confirmed_at"] < CRASH_COOLDOWN_SECONDS:
-                box_color = (255,0,0,255); text_bg = (200,0,0,220); status_tag = "CONFIRMED"
+                box_color  = (255, 0, 0, 255)
+                text_bg    = (200, 0, 0, 220)
+                status_tag = "CONFIRMED"
             elif cs["first_seen"] is not None and not cs["confirmed"]:
-                pct = min(1.0, cs["elapsed"]/CRASH_CONFIRM_SECONDS)
-                fill = int(pct*255)
-                box_color = (255,fill,0,255); text_bg = (160,100,0,200)
+                pct        = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
+                fill       = int(pct * 255)
+                box_color  = (255, fill, 0, 255)
+                text_bg    = (160, 100, 0, 200)
                 status_tag = f"VERIFYING {cs['elapsed']:.1f}/{CRASH_CONFIRM_SECONDS}s"
             else:
                 continue
             draw.rectangle([x1,y1,x2,y2], outline=box_color, width=3)
             text = f"{b['label']} {b['conf']*100:.0f}% {b['side']} | {status_tag}"
-            tw   = len(text)*7
+            tw   = len(text) * 7
             draw.rectangle([x1, max(0,y1-20), x1+tw, y1], fill=text_bg)
             draw.text((x1+2, max(0,y1-18)), text, fill=(255,255,255,255), font=sfont)
+
         if cs["first_seen"] is not None and not cs["confirmed"]:
-            pct = min(1.0, cs["elapsed"]/CRASH_CONFIRM_SECONDS)
-            iw, ih = img.size; bar_w = int(iw*pct)
-            draw.rectangle([0,ih-8,iw,ih], fill=(40,40,40,200))
-            draw.rectangle([0,ih-8,bar_w,ih], fill=(255,int(255*(1-pct)),0,220))
-        out = io.BytesIO(); img.save(out, format='JPEG', quality=70)
+            pct    = min(1.0, cs["elapsed"] / CRASH_CONFIRM_SECONDS)
+            iw, ih = img.size
+            bar_w  = int(iw * pct)
+            draw.rectangle([0, ih-8, iw, ih], fill=(40,40,40,200))
+            draw.rectangle([0, ih-8, bar_w, ih], fill=(255, int(255*(1-pct)), 0, 220))
+
+        out = io.BytesIO()
+        img.save(out, format='JPEG', quality=70)
         return out.getvalue()
     except Exception as e:
-        print(f"Overlay error cam{cam_idx}: {e}"); return frame_bytes
-
+        print(f"Overlay error cam{cam_idx}: {e}")
+        return frame_bytes
 
 # ═════════════════════════════════════════════════════
 # COMBINE FRAMES (360°)
@@ -776,24 +815,25 @@ def combine_frames(front_bytes, rear_bytes):
     try:
         front  = Image.open(io.BytesIO(front_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT), Image.LANCZOS)
         rear   = Image.open(io.BytesIO(rear_bytes)).convert('RGB').resize((CAM_WIDTH, CAM_HEIGHT), Image.LANCZOS)
-        canvas = Image.new('RGB', (COMBINED_W, COMBINED_H+30), (10,10,10))
-        canvas.paste(front, (0, 30)); canvas.paste(rear, (CAM_WIDTH, 30))
-        draw = ImageDraw.Draw(canvas)
+        canvas = Image.new('RGB', (COMBINED_W, COMBINED_H + 30), (10, 10, 10))
+        canvas.paste(front, (0, 30))
+        canvas.paste(rear,  (CAM_WIDTH, 30))
+        draw  = ImageDraw.Draw(canvas)
         try:
             hfont = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
         except Exception:
             hfont = ImageFont.load_default()
-        draw.rectangle([0,0,COMBINED_W,30], fill=(10,10,10))
-        draw.text((8,7),             "◀ FRONT", fill=(0,200,255), font=hfont)
-        draw.text((CAM_WIDTH+8,7),   "REAR ▶",  fill=(255,120,0),  font=hfont)
+        draw.rectangle([0, 0, COMBINED_W, 30], fill=(10, 10, 10))
+        draw.text((8, 7),             "◀ FRONT", fill=(0, 200, 255), font=hfont)
+        draw.text((CAM_WIDTH + 8, 7), "REAR ▶",  fill=(255, 120, 0),  font=hfont)
         draw.line([(CAM_WIDTH,0),(CAM_WIDTH,COMBINED_H+30)], fill=(40,40,40), width=2)
         ts = time.strftime("%Y-%m-%d  %H:%M:%S")
-        draw.text((COMBINED_W//2-90,7), ts, fill=(180,180,180), font=hfont)
-        out = io.BytesIO(); canvas.save(out, format='JPEG', quality=85)
+        draw.text((COMBINED_W//2 - 90, 7), ts, fill=(180,180,180), font=hfont)
+        out = io.BytesIO()
+        canvas.save(out, format='JPEG', quality=85)
         return out.getvalue()
     except Exception as e:
         print(f"Combine error: {e}"); return front_bytes
-
 
 # ═════════════════════════════════════════════════════
 # CAMERA THREAD
@@ -805,9 +845,9 @@ def kill_existing_cameras():
         time.sleep(1)
     except Exception: pass
 
-
 def camera_thread(cam_idx):
-    cam = cameras[cam_idx]; consecutive_failures = 0
+    cam = cameras[cam_idx]
+    consecutive_failures = 0
     while True:
         process = None; frames_captured = 0
         set_cam_status(cam_idx, "Starting...")
@@ -828,7 +868,8 @@ def camera_thread(cam_idx):
                  '--ev',        '1.5',
                  '--gain',      '4.0',
                  '--denoise',   'off',
-                 '--inline', '--nopreview', '--flush', '1', '-o', '-'],
+                 '--inline', '--nopreview',
+                 '--flush', '1', '-o', '-'],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             SOI=b'\xff\xd8'; EOI=b'\xff\xd9'; buffer=b''
             last_frame_time=time.time()
@@ -866,11 +907,10 @@ def camera_thread(cam_idx):
                 except Exception:
                     try: process.kill()
                     except Exception: pass
-        consecutive_failures = 0 if frames_captured > 0 else consecutive_failures+1
-        delay = min(15, 2*(consecutive_failures+1))
-        set_cam_status(cam_idx, f"Restarting in {delay}s...")
+        consecutive_failures = 0 if frames_captured>0 else consecutive_failures+1
+        delay=min(15,2*(consecutive_failures+1))
+        set_cam_status(cam_idx,f"Restarting in {delay}s...")
         time.sleep(delay)
-
 
 # ═════════════════════════════════════════════════════
 # WORKERS
@@ -902,7 +942,6 @@ def overlay_worker():
                 global combined_frame; combined_frame=combined
             if not combined_ready.is_set(): combined_ready.set()
 
-
 def ml_worker():
     last={0:None,1:None}
     while True:
@@ -920,12 +959,11 @@ def ml_worker():
             last[idx]=frame
             detect_accidents_in_frame(idx,frame)
 
-
 def gps_worker():
     def push(lat,lon,speed):
         with gps_state_lock: gps_state.update({"lat":lat,"lon":lon,"speed":speed})
     try:
-        import serial, pynmea2
+        import serial,pynmea2
         while True:
             try:
                 with serial.Serial(GPS_PORT,GPS_BAUD,timeout=1) as ser:
@@ -943,7 +981,6 @@ def gps_worker():
         if STATIC_LAT and STATIC_LON:
             while True: push(STATIC_LAT,STATIC_LON,0); time.sleep(30)
         else: print("[GPS] No GPS module configured")
-
 
 # ═════════════════════════════════════════════════════
 # FRAME GENERATORS
@@ -975,7 +1012,6 @@ def generate_combined():
         stall=0; last=frame
         yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame+b'\r\n'
 
-
 # ═════════════════════════════════════════════════════
 # FLASK ROUTES
 # ═════════════════════════════════════════════════════
@@ -997,7 +1033,7 @@ def after_request(response):
     return response
 
 @app.route('/crash_alert')
-def crash_alert_status():
+def crash_alert():
     with crash_record_lock:
         state = dict(crash_record_state)
     if not state["active"]:
@@ -1011,19 +1047,17 @@ def crash_alert_status():
     })
 
 @app.route('/crash_cancel', methods=['POST'])
-def crash_cancel_route():
+def crash_cancel():
     with crash_record_lock:
-        event      = crash_record_state.get("cancel_event")
-        active     = crash_record_state.get("active", False)
+        event  = crash_record_state.get("cancel_event")
+        active = crash_record_state.get("active", False)
         session_id = crash_record_state.get("session_id")
-
     if not active or event is None:
         return jsonify({"error": "No active crash alert"}), 400
-
     event.set()
-    print("[CRASH] Cancel received from rider UI")
-
-    # Tell Relay to cancel too
+    print("[CRASH] Cancel received")
+    
+    # NEW: Notify Relay to cancel the alert
     if session_id:
         try:
             resp = req_lib.post(
@@ -1031,12 +1065,12 @@ def crash_cancel_route():
                 json={"session_id": session_id},
                 timeout=5
             )
-            print(f"[RELAY] Cancel sent: {resp.status_code}")
+            print(f"[RELAY] Cancel notification sent")
         except Exception as e:
-            print(f"[RELAY] Cancel failed: {e}")
-
+            print(f"[RELAY] Cancel notification failed: {e}")
+    
     return jsonify({"success": True, "message": "Cancelled. Recording deleted."})
-
+    
 @app.route('/stream')
 def stream_combined():
     return Response(generate_combined(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -1110,7 +1144,6 @@ def device_info():
     return jsonify({
         "device_id":           DEVICE_ID,
         "owner_email":         OWNER_EMAIL,
-        "relay_url":           RELAY_URL,
         "resolution":          f"{CAM_WIDTH}x{CAM_HEIGHT}",
         "fps":                 CAM_FPS,
         "combined_resolution": f"{COMBINED_W}x{COMBINED_H}",
@@ -1187,29 +1220,30 @@ def index():
 <body>
 <div class="header"><div class="logo">PI<span>CAM</span> 360</div><div class="hdr-right"><div><span class="dot" id="df"></span>FRONT</div><div><span class="dot" id="dr"></span>REAR</div><div style="color:var(--cyan)" id="clk"></div></div></div>
 <div class="view-bar"><button class="vbtn active" id="vb360" onclick="sv('360')">◈ 360°</button><button class="vbtn" id="vbfr" onclick="sv('front')">◀ FRONT</button><button class="vbtn" id="vbre" onclick="sv('rear')">REAR ▶</button><button class="vbtn" id="vbsp" onclick="sv('split')">⊞ SPLIT</button></div>
-<div id="crash-banner"><div><span class="crash-info">🚨 CRASH DETECTED — </span><span style="color:var(--dim);font-size:11px">Alert sends in <span class="crash-secs" id="csecs">10s</span></span></div><button class="cancel-btn" onclick="doCancel()">✕ FALSE ALARM — CANCEL</button></div>
+<div id="crash-banner"><div><span class="crash-info">🚨 CRASH DETECTED — </span><span style="color:var(--dim);font-size:11px">Uploading + email sends in <span class="crash-secs" id="csecs">10s</span></span></div><button class="cancel-btn" onclick="doCancel()">✕ FALSE ALARM — CANCEL</button></div>
 <div class="stream-wrapper" id="sw"><div id="v360" style="position:relative;display:flex;justify-content:center;width:100%"><img class="stream-360" id="s360" src="/stream"><span class="cam-lbl cam-lbl-f">◀ FRONT</span><span class="cam-lbl cam-lbl-r">REAR ▶</span></div><div id="vfr" style="display:none;width:100%"><img class="stream-single" id="sfr" src="/stream/front"></div><div id="vre" style="display:none"><img class="stream-single" id="sre" src="/stream/rear"></div><div class="stream-split" id="vsp" style="display:none"><img id="spf" src="/stream/front"><div class="split-div"></div><img id="spr" src="/stream/rear"></div></div>
 <div class="grid"><div class="panel"><div class="ptitle"><span class="rdot"></span>Controls</div><div class="ctrl-row"><button class="btn" id="bml" onclick="toggleML()">ML Detect</button></div><div style="margin-top:8px;font-size:10px;color:var(--dim);border-top:1px solid var(--border);padding-top:6px">Resolution: <span style="color:var(--cyan)">640×480</span><br>Combined: <span style="color:var(--cyan)">1280×480</span><br>FPS: <span style="color:var(--cyan)">30</span></div></div>
 <div class="panel" style="grid-column:span 2"><div class="ptitle">⚠ Accident Detection</div><div id="mlp" style="font-size:11px;color:var(--dim)">ML Detection: OFF</div></div>
 <div class="panel"><div class="ptitle">◉ Camera Status</div><div class="srow"><span class="sk">FRONT</span><span class="sv" id="stf">—</span></div><div class="srow"><span class="sk">REAR</span> <span class="sv" id="str">—</span></div></div>
 <div class="panel" style="grid-column:span 2"><div class="ptitle">◎ GPS Location</div><div class="gps-grid"><div><div class="gk">LAT</div><div class="gv" id="glat">—</div></div><div><div class="gk">LON</div><div class="gv" id="glon">—</div></div><div><div class="gk">SPEED</div><div class="gv" id="gspd">—</div></div><div><div class="gk">FIX</div><div class="gv" id="gfix" style="color:var(--dim)">NO FIX</div></div></div></div>
-<div class="panel"><div class="ptitle">☁ Firebase</div><div class="srow"><span class="sk">DEVICE ID</span><span class="sv" id="did" style="font-size:9px">—</span></div><div class="srow"><span class="sk">OWNER</span><span class="sv" id="dem" style="font-size:9px">—</span></div><div class="srow"><span class="sk">RELAY</span><span class="sv" id="drl" style="font-size:9px">—</span></div></div></div>
-<script>let mlOn=false,crashActive=false;async function toggleML(){mlOn=!mlOn;await fetch('/ml',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:mlOn})});document.getElementById('bml').classList.toggle('on-org',mlOn);if(mlOn)setInterval(pollML,500);else document.getElementById('mlp').innerHTML='<span style="color:var(--dim)">ML Detection: OFF</span>';}async function pollML(){if(!mlOn)return;try{const d=await(await fetch('/ml_results')).json();let h='';['front','rear'].forEach(k=>{const v=d[k];const lbl=k==='front'?'FRONT':'REAR';const cls=k==='front'?'ml-hdr-f':'ml-hdr-r';h+=`<div class="ml-sec"><span class="ml-hdr ${cls}">${lbl}</span>`;if(!v||(!v.first_seen&&!v.confirmed))h+='<div style="font-size:10px;color:var(--dim);margin:3px 0">No detections</div>';else if(v.confirmed)h+='<div class="alert-box"><div class="alert-lbl">🚨 CRASH CONFIRMED</div></div>';else if(v.first_seen){const p=Math.min(1,v.elapsed/v.confirm_secs);h+=`<div style="font-size:10px;color:var(--yellow)">⏱ ${v.elapsed.toFixed(1)}/${v.confirm_secs}s</div><div class="bar-wrap"><div class="bar-fill" style="width:${p*100}%;background:rgb(${Math.round(255*p)},${Math.round(255*(1-p))},0)"></div></div>`;}h+='</div>';});document.getElementById('mlp').innerHTML=h;}catch(e){}}async function pollCrash(){try{const d=await(await fetch('/crash_alert')).json();const banner=document.getElementById('crash-banner');if(d.active){banner.style.display='flex';document.getElementById('csecs').innerText=Math.ceil(d.seconds_left)+'s';crashActive=true;}else if(crashActive){banner.style.display='none';crashActive=false;}}catch(e){}}async function doCancel(){try{const res=await fetch('/crash_cancel',{method:'POST'});const d=await res.json();if(d.success){crashActive=false;document.getElementById('crash-banner').style.display='none';}}catch(e){alert('Could not cancel — check Pi connection');}}async function pollStatus(){try{const d=await(await fetch('/status')).json();document.getElementById('stf').innerText=d.front||'—';document.getElementById('str').innerText=d.rear||'—';document.getElementById('df').className='dot'+(d.front&&d.front.includes('Streaming')?'live':' warn');document.getElementById('dr').className='dot'+(d.rear&&d.rear.includes('Streaming')?'live':' warn');}catch(e){}}async function pollGPS(){try{const d=await(await fetch('/gps')).json();if(d.lat&&d.lon){document.getElementById('glat').innerText=d.lat.toFixed(5)+'°';document.getElementById('glon').innerText=d.lon.toFixed(5)+'°';document.getElementById('gspd').innerText=d.speed?d.speed.toFixed(1)+' km/h':'—';document.getElementById('gfix').innerText='ACTIVE';document.getElementById('gfix').style.color='var(--green)';};}catch(e){}}async function loadInfo(){try{const d=await(await fetch('/device/info')).json();document.getElementById('did').innerText=d.device_id||'—';document.getElementById('dem').innerText=d.owner_email||'—';document.getElementById('drl').innerText=d.relay_url||'—';}catch(e){}}function sv(v){const ids={360:'v360',front:'vfr',rear:'vre',split:'vsp'};const btns={360:'vb360',front:'vbfr',rear:'vbre',split:'vbsp'};Object.keys(ids).forEach(x=>{const el=document.getElementById(ids[x]);el.style.display=x===v?(x==='split'?'flex':'block'):'none';document.getElementById(btns[x]).classList.toggle('active',x===v);});}function watchStreams(){[{id:'s360',src:'/stream'},{id:'sfr',src:'/stream/front'},{id:'sre',src:'/stream/rear'},{id:'spf',src:'/stream/front'},{id:'spr',src:'/stream/rear'}].forEach(s=>{const el=document.getElementById(s.id);if(!el)return;el.onerror=()=>setTimeout(()=>{el.src=s.src+'?t='+Date.now();},3000);});}function tick(){document.getElementById('clk').innerText=new Date().toTimeString().slice(0,8);}loadInfo();watchStreams();setInterval(tick,1000);setInterval(pollStatus,2000);setInterval(pollGPS,3000);setInterval(pollCrash,1000);
+<div class="panel"><div class="ptitle">☁ Firebase</div><div class="srow"><span class="sk">DEVICE ID</span><span class="sv" id="did" style="font-size:9px">—</span></div><div class="srow"><span class="sk">OWNER</span><span class="sv" id="dem" style="font-size:9px">—</span></div><div class="srow"><span class="sk">EMAIL QUEUE</span><span class="sv" id="eq" style="font-size:9px">—</span></div></div></div>
+<script>let mlOn=false,crashActive=false;async function toggleML(){mlOn=!mlOn;await fetch('/ml',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:mlOn})});document.getElementById('bml').classList.toggle('on-org',mlOn);if(mlOn)setInterval(pollML,500);else document.getElementById('mlp').innerHTML='<span style="color:var(--dim)">ML Detection: OFF</span>';}async function pollML(){if(!mlOn)return;try{const d=await(await fetch('/ml_results')).json();let h='';['front','rear'].forEach(k=>{const v=d[k];const lbl=k==='front'?'FRONT':'REAR';const cls=k==='front'?'ml-hdr-f':'ml-hdr-r';h+=`<div class="ml-sec"><span class="ml-hdr ${cls}">${lbl}</span>`;if(!v||(!v.first_seen&&!v.confirmed))h+='<div style="font-size:10px;color:var(--dim);margin:3px 0">No detections</div>';else if(v.confirmed)h+='<div class="alert-box"><div class="alert-lbl">🚨 CRASH CONFIRMED</div></div>';else if(v.first_seen){const p=Math.min(1,v.elapsed/v.confirm_secs);h+=`<div style="font-size:10px;color:var(--yellow)">⏱ ${v.elapsed.toFixed(1)}/${v.confirm_secs}s</div><div class="bar-wrap"><div class="bar-fill" style="width:${p*100}%;background:rgb(${Math.round(255*p)},${Math.round(255*(1-p))},0)"></div></div>`;}h+='</div>';});document.getElementById('mlp').innerHTML=h;}catch(e){}}async function pollCrash(){try{const d=await(await fetch('/crash_alert')).json();const banner=document.getElementById('crash-banner');if(d.active){banner.style.display='flex';document.getElementById('csecs').innerText=Math.ceil(d.seconds_left)+'s';crashActive=true;}else if(crashActive){banner.style.display='none';crashActive=false;}}catch(e){}}async function doCancel(){try{const res=await fetch('/crash_cancel',{method:'POST'});const d=await res.json();if(d.success){crashActive=false;document.getElementById('crash-banner').style.display='none';}}catch(e){alert('Could not cancel — check Pi connection');}}async function pollStatus(){try{const d=await(await fetch('/status')).json();document.getElementById('stf').innerText=d.front||'—';document.getElementById('str').innerText=d.rear||'—';document.getElementById('df').className='dot'+(d.front&&d.front.includes('Streaming')?'live':' warn');document.getElementById('dr').className='dot'+(d.rear&&d.rear.includes('Streaming')?'live':' warn');}catch(e){}}async function pollGPS(){try{const d=await(await fetch('/gps')).json();if(d.lat&&d.lon){document.getElementById('glat').innerText=d.lat.toFixed(5)+'°';document.getElementById('glon').innerText=d.lon.toFixed(5)+'°';document.getElementById('gspd').innerText=d.speed?d.speed.toFixed(1)+' km/h':'—';document.getElementById('gfix').innerText='ACTIVE';document.getElementById('gfix').style.color='var(--green)';};}catch(e){}}async function pollQueue(){try{const d=await(await fetch('/email_queue_status')).json();const el=document.getElementById('eq');if(d.queued===0)el.innerText='None pending';else el.innerText=d.queued+' pending '+(d.internet?'(sending…)':'(offline, waiting)');}catch(e){}}async function loadInfo(){try{const d=await(await fetch('/device/info')).json();document.getElementById('did').innerText=d.device_id||'—';document.getElementById('dem').innerText=d.owner_email||'—';}catch(e){}}function sv(v){const ids={360:'v360',front:'vfr',rear:'vre',split:'vsp'};const btns={360:'vb360',front:'vbfr',rear:'vbre',split:'vbsp'};Object.keys(ids).forEach(x=>{const el=document.getElementById(ids[x]);el.style.display=x===v?(x==='split'?'flex':'block'):'none';document.getElementById(btns[x]).classList.toggle('active',x===v);});}function watchStreams(){[{id:'s360',src:'/stream'},{id:'sfr',src:'/stream/front'},{id:'sre',src:'/stream/rear'},{id:'spf',src:'/stream/front'},{id:'spr',src:'/stream/rear'}].forEach(s=>{const el=document.getElementById(s.id);if(!el)return;el.onerror=()=>setTimeout(()=>{el.src=s.src+'?t='+Date.now();},3000);});}function tick(){document.getElementById('clk').innerText=new Date().toTimeString().slice(0,8);}loadInfo();watchStreams();setInterval(tick,1000);setInterval(pollStatus,2000);setInterval(pollGPS,3000);setInterval(pollCrash,1000);setInterval(pollQueue,5000);
 </script>
 </body>
 </html>'''
     return render_template_string(html)
 
-
 if __name__ == "__main__":
     print("="*60)
-    print("  Pi Dual Camera — 640x480 + Relay + Crash Email")
+    print("  Pi Dual Camera — 640x480 + Firebase Storage + Crash Email")
     print("="*60)
-    print(f"  Owner:   {OWNER_EMAIL}")
-    print(f"  Device:  {DEVICE_ID}")
-    print(f"  Relay:   {RELAY_URL}")
+    print(f"  Owner: {OWNER_EMAIL}")
+    print(f"  Device ID: {DEVICE_ID}")
+    print(f"  Firebase project: {FIREBASE_PROJECT_ID}")
+    print(f"  Storage bucket:   {FIREBASE_STORAGE_BUCKET}")
+    print(f"  CrashEvents collection: {CRASH_EVENTS_COLLECTION}")
 
-    print("\nLoading ML model...")
+    print("\nLoading ML model…")
     model = YOLO("accident_model_latest.pt")
     print("✓ Model loaded!")
 
@@ -1237,10 +1271,13 @@ if __name__ == "__main__":
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
     print(f"\n{'='*60}")
-    print(f"  UI:      http://{local_ip}:{selected_port}/")
-    print(f"  Stream:  http://{local_ip}:{selected_port}/stream")
-    print(f"  Crash:   http://{local_ip}:{selected_port}/crash_alert")
-    print(f"  Cancel:  http://{local_ip}:{selected_port}/crash_cancel [POST]")
+    print(f"  🎥 UI:            http://{local_ip}:{selected_port}/")
+    print(f"  📡 Stream:        http://{local_ip}:{selected_port}/stream")
+    print(f"  🚨 Crash alert:   http://{local_ip}:{selected_port}/crash_alert")
+    print(f"  ✋  Cancel:        http://{local_ip}:{selected_port}/crash_cancel [POST]")
+    print(f"  ☁  Firebase:      crashes/{{session_id}}/  in Storage")
+    print(f"  📋 Firestore:     {CRASH_EVENTS_COLLECTION}/{{session_id}}")
+    print(f"  📧 SMTP backup:   {SMTP_USER} via {SMTP_HOST}:{SMTP_PORT}")
     print(f"{'='*60}\n")
 
     app.run(host='0.0.0.0', port=selected_port, threaded=True)
